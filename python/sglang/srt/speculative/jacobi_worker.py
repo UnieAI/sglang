@@ -24,6 +24,7 @@ class JacobiWorker:
     ):
         self.server_args = server_args
         self.target_worker = target_worker
+        self.model_config = target_worker.model_config
         self.model_runner = target_worker.model_runner
         self.device = self.model_runner.device
         self.block_size = server_args.speculative_num_draft_tokens or 1
