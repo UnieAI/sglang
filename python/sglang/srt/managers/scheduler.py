@@ -274,6 +274,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.jacobi_rr_idx = 0
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -1760,8 +1761,15 @@ class Scheduler(
         else:
             # Run decode
             if not self.running_batch.is_empty():
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+                if self.running_batch.is_jacobi:
+                    ret = self.update_running_batch_jacobi(self.running_batch)
+                else:
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    ret = (
+                        self.running_batch
+                        if not self.running_batch.is_empty()
+                        else None
+                    )
             else:
                 ret = None
 
@@ -2003,6 +2011,10 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
+        if batch.is_jacobi:
+            for req in batch.reqs:
+                req.init_next_round_input(self.tree_cache)
+
         # Check if decode out of memory
         if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
@@ -2041,6 +2053,79 @@ class Scheduler(
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def update_running_batch_jacobi(
+        self, batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        """Update running batch state and build a single-request Jacobi batch."""
+        initial_bs = batch.batch_size()
+
+        batch.filter_batch(v1_spec_info_filtered=True)
+        if batch.is_empty():
+            batch.batch_is_full = False
+            return None
+
+        if batch.batch_size() < initial_bs:
+            batch.batch_is_full = False
+
+        selected_idx = self.jacobi_rr_idx % batch.batch_size()
+        batch.reqs[selected_idx].init_next_round_input(self.tree_cache)
+
+        if not batch.check_decode_mem(
+            self.decode_mem_cache_buf_multiplier, selected_indices=[selected_idx]
+        ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
+            old_ratio = self.new_token_ratio
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                self.server_args, self.decode_mem_cache_buf_multiplier
+            )
+            self.num_retracted_reqs = len(retracted_reqs)
+            if self.enable_metrics and (x := len(retracted_reqs)) > 0:
+                self.metrics_collector.increment_num_retracted_reqs(x)
+            self.new_token_ratio = new_token_ratio
+            for req in reqs_to_abort:
+                abort_reason: FINISH_ABORT = req.to_finish
+                self.send_to_tokenizer.send_output(
+                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                )
+
+            logger.info(
+                "KV cache pool is full. Retract requests. "
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+            )
+
+            for req in retracted_reqs:
+                self._add_request_to_queue(req, is_retracted=True)
+            if retracted_reqs:
+                batch.batch_is_full = False
+
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return None
+
+            selected_idx = self.jacobi_rr_idx % batch.batch_size()
+            batch.reqs[selected_idx].init_next_round_input(self.tree_cache)
+        else:
+            self.new_token_ratio = max(
+                self.new_token_ratio - self.new_token_ratio_decay,
+                self.min_new_token_ratio,
+            )
+
+        self.jacobi_rr_idx = (selected_idx + 1) % batch.batch_size()
+
+        run_batch = ScheduleBatch.init_new(
+            reqs=[batch.reqs[selected_idx]],
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            dllm_config=self.dllm_config,
+        )
+        run_batch.batch_is_full = batch.batch_is_full
+        run_batch.prepare_for_decode()
+        return run_batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
@@ -2203,7 +2288,9 @@ class Scheduler(
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
-            if batch.is_dllm():
+            if batch.is_jacobi:
+                self.process_batch_result_jacobi(batch, result)
+            elif batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)

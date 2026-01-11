@@ -428,6 +428,10 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    jacobi_steps_per_yield: int = 1
+    jacobi_num_blocks: int = 1
+    jacobi_ngram_pool_size: int = 0
+    jacobi_prefill_random: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2077,6 +2081,30 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+        if self.speculative_algorithm == "JACOBI":
+            allowed_prefixes = (
+                "Qwen2",
+                "Qwen3",
+                "Llama",
+                "Mistral",
+                "Mixtral",
+                "Gemma",
+                "GptOss",
+            )
+            if self.jacobi_num_blocks < 1:
+                raise ValueError("jacobi_num_blocks must be >= 1.")
+            if self.jacobi_ngram_pool_size < 0:
+                raise ValueError("jacobi_ngram_pool_size must be >= 0.")
+            architectures = self.get_hf_config().architectures or []
+            allowed = any(
+                arch.endswith("ForCausalLM") and arch.startswith(allowed_prefixes)
+                for arch in architectures
+            )
+            if not allowed:
+                raise ValueError(
+                    "Jacobi MVP supports only causal LLM architectures from "
+                    "Qwen2/Qwen3/Llama/Mistral/Mixtral/Gemma."
+                )
 
     def _handle_load_format(self):
         if (
@@ -3323,7 +3351,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "JACOBI"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3366,6 +3394,30 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--jacobi-steps-per-yield",
+            type=int,
+            help="The number of Jacobi refinement steps to run before yielding to the scheduler.",
+            default=ServerArgs.jacobi_steps_per_yield,
+        )
+        parser.add_argument(
+            "--jacobi-num-blocks",
+            type=int,
+            help="The number of Jacobi blocks (K) to draft per step.",
+            default=ServerArgs.jacobi_num_blocks,
+        )
+        parser.add_argument(
+            "--jacobi-ngram-pool-size",
+            type=int,
+            help="The max n-gram pool size per request (0 disables).",
+            default=ServerArgs.jacobi_ngram_pool_size,
+        )
+        parser.add_argument(
+            "--jacobi-prefill-random",
+            action="store_true",
+            help="Initialize Jacobi draft with random tokens during prefill.",
+            default=ServerArgs.jacobi_prefill_random,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

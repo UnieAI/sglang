@@ -399,6 +399,15 @@ class LogitsProcessor(nn.Module):
                 full_logits=full_logits,
                 next_token_logits=None,
             )
+        if (
+            get_global_server_args().speculative_algorithm == "JACOBI"
+            and logits_metadata.forward_mode == ForwardMode.EXTEND
+        ):
+            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+            return LogitsProcessorOutput(
+                full_logits=full_logits,
+                next_token_logits=None,
+            )
 
         # Get the last hidden states and last logits for the next token prediction
         if (

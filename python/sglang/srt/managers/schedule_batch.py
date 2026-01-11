@@ -39,6 +39,8 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import math
+import random
 import re
 import time
 from enum import Enum, auto
@@ -501,6 +503,12 @@ class Req:
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        self.jacobi_draft_ids: List[int] = []
+        self.jacobi_enabled = (
+            get_global_server_args().speculative_algorithm == "JACOBI"
+        )
+        self.jacobi_needs_bootstrap = False
+        self.jacobi_ngram_pool: List[List[int]] = []
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -509,6 +517,9 @@ class Req:
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.jacobi_draft_ids = []
+        self.jacobi_needs_bootstrap = False
+        self.jacobi_ngram_pool = []
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -621,6 +632,20 @@ class Req:
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
         self.logprob_start_len = 0
+        if self.jacobi_enabled:
+            if self.stream:
+                raise ValueError("Jacobi MVP does not support streaming responses.")
+            if self.return_logprob:
+                raise ValueError("Jacobi MVP does not support return_logprob.")
+            if any(
+                [
+                    self.sampling_params.regex,
+                    self.sampling_params.ebnf,
+                    self.sampling_params.json_schema,
+                    self.sampling_params.structural_tag,
+                ]
+            ):
+                raise ValueError("Jacobi MVP does not support grammar constraints.")
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
         self.temp_scaled_logprobs = False
@@ -809,15 +834,44 @@ class Req:
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            if self.jacobi_enabled:
+                if not self.jacobi_draft_ids:
+                    server_args = get_global_server_args()
+                    block_len = server_args.speculative_num_draft_tokens or 1
+                    draft_len = block_len * max(server_args.jacobi_num_blocks, 1)
+                    if (
+                        server_args.jacobi_prefill_random
+                        and self.vocab_size
+                        and self.vocab_size > 0
+                    ):
+                        self.jacobi_draft_ids = [
+                            random.randrange(self.vocab_size)
+                            for _ in range(draft_len)
+                        ]
+                    else:
+                        last_token = (
+                            self.output_ids[-1]
+                            if self.output_ids
+                            else self.origin_input_ids[-1]
+                        )
+                        self.jacobi_draft_ids = [last_token] * draft_len
+                    self.jacobi_needs_bootstrap = True
+                    self.jacobi_ngram_pool = []
+                self.fill_ids = (
+                    self.origin_input_ids + self.output_ids + self.jacobi_draft_ids
+                )
+            else:
+                self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
+        stable_ids = self.origin_input_ids + self.output_ids
+        stable_input_len = len(stable_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
-        max_prefix_len = input_len - 1
+        max_prefix_len = stable_input_len - 1
         if self.return_logprob:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
-        token_ids = self.fill_ids[:max_prefix_len]
+        token_ids = stable_ids[:max_prefix_len]
 
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
@@ -1666,6 +1720,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
+        if self.is_jacobi:
+            server_args = get_global_server_args()
+            total_pages = 0
+            for req in requests:
+                draft_len = len(req.jacobi_draft_ids)
+                if draft_len == 0:
+                    block_len = server_args.speculative_num_draft_tokens or 1
+                    draft_len = block_len * max(server_args.jacobi_num_blocks, 1)
+                if page_size == 1:
+                    total_pages += draft_len
+                else:
+                    cur_pages = int(math.ceil(req.seqlen / page_size))
+                    next_pages = int(math.ceil((req.seqlen + draft_len) / page_size))
+                    total_pages += max(0, next_pages - cur_pages)
+            return total_pages
         if page_size == 1:
             return len(requests)
 
@@ -1823,7 +1892,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME: finally deprecate is_eagle_v2
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
+    @property
+    def is_jacobi(self):
+        return getattr(self.spec_algorithm, "name", None) == "JACOBI"
+
     def prepare_for_decode(self):
+        if self.is_jacobi:
+            self.prepare_for_extend()
+            self.forward_mode = ForwardMode.EXTEND
+            return
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 

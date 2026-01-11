@@ -471,7 +471,11 @@ class Qwen2ForCausalLM(nn.Module):
                 )
                 self.lm_head.weight.copy_(emb_token_weight)
 
-        self.logits_processor = LogitsProcessor(config)
+        server_args = get_global_server_args()
+        return_full_logits = server_args.speculative_algorithm == "JACOBI"
+        self.logits_processor = LogitsProcessor(
+            config, return_full_logits=return_full_logits
+        )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False

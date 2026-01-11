@@ -1,0 +1,8 @@
+accelerate>=0.30.0
+datasets>=2.20.0
+einops>=0.7.0
+peft>=0.10.0
+transformers>=4.41.0
+wandb>=0.16.0
+# Optional for speed
+# flash-attn>=2.5.0

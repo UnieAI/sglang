@@ -317,6 +317,18 @@ register_speculative_algorithm(
 )
 
 
+def _create_jacobi_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.jacobi_worker import JacobiWorker
+
+    return JacobiWorker(**kwargs)
+
+
+register_speculative_algorithm(
+    "JACOBI",
+    worker_cls=_create_jacobi_worker,
+)
+
+
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it

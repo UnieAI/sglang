@@ -24,6 +24,7 @@ class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[torch.Tensor] = None
+    draft_ids: Optional[torch.Tensor] = None
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
@@ -63,6 +64,8 @@ class GenerationBatchResult:
                 "cpu", non_blocking=True
             )
         self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        if self.draft_ids is not None:
+            self.draft_ids = self.draft_ids.to("cpu", non_blocking=True)
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
