@@ -115,6 +115,6 @@ print(sgl.gen("def fibonacci(n):", max_tokens=64))
 ---
 
 ## 4) 限制与注意事项
-- Jacobi 仍不支持 streaming、return_logprob、grammar 约束。
+- Jacobi 不支持 return_logprob 与 grammar 约束；streaming 已支持（按 `stream_interval` 进行分段输出）。
 - MoE 模型建议先用 `--jacobi-num-blocks 1` 做稳定性验证。
 - OOM 优先降低 `--speculative-num-draft-tokens` 或 `--jacobi-num-blocks`。

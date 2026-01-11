@@ -67,7 +67,7 @@ python -m sglang.launch_server \
 
 ### Phase 0: Scope and Guardrails
 - Owner: @_____ | ETA: ____
-- [x] Lock MVP boundaries: batch size = 1, no `return_logprob`, no grammar, no streaming.
+- [x] Lock MVP boundaries: batch size = 1, no `return_logprob`, no grammar.
 - [x] Target model families: Qwen2/Qwen3/Llama/Mistral/Mixtral/Gemma/GPT-OSS (causal LM only).
 - [x] Use `--speculative-num-draft-tokens` as Jacobi block size (no new block-size flag for MVP).
 

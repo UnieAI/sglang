@@ -633,8 +633,6 @@ class Req:
         # Start index to compute logprob from.
         self.logprob_start_len = 0
         if self.jacobi_enabled:
-            if self.stream:
-                raise ValueError("Jacobi MVP does not support streaming responses.")
             if self.return_logprob:
                 raise ValueError("Jacobi MVP does not support return_logprob.")
             if any(
