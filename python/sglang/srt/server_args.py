@@ -2053,17 +2053,11 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
-            self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = (
                     self.speculative_ngram_max_match_window_size
                 )
-            logger.warning(
-                "The overlap scheduler and mixed chunked prefill are disabled because of "
-                "using ngram speculative decoding."
-            )
 
             if (
                 self.speculative_eagle_topk > 1
@@ -4525,10 +4519,10 @@ class ServerArgs:
         self.check_torch_2_9_1_cudnn_compatibility()
 
         # Check speculative decoding
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm is not None and self.speculative_algorithm != "NGRAM":
             assert (
                 not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+            ), "Mixed chunked prefill is not supported for this speculative decoding mode."
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
