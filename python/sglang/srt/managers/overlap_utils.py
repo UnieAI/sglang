@@ -56,16 +56,16 @@ class FutureMap:
         self.device = device
         self.spec_algo = spec_algo
 
-        if self.spec_algo.is_none():
-            # For non-speculative decoding, we only need to store the token ids.
+        if self.spec_algo.is_eagle():
+            # For EAGLE-based speculative decoding, we lazily initialize the buffers
+            # to make the shape derivation easier.
+            self.buf_initialized = False
+        else:
+            # For non-EAGLE decoding, we only need to store the token ids.
             self.buf_initialized = True
             self.token_ids_buf = torch.empty(
                 (self.future_buffer_len,), dtype=torch.int64, device=self.device
             )
-        else:
-            # For speculative decoding, we lazily initialize the buffers
-            # This is to make the shape derivation easier.
-            self.buf_initialized = False
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True

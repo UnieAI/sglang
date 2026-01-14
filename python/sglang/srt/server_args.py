@@ -2046,6 +2046,11 @@ class ServerArgs:
                 raise ValueError(
                     "Ngram speculative decoding only supports CUDA device."
                 )
+            if not self.disable_overlap_schedule:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because NGRAM speculative decoding does not support overlap schedule."
+                )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -2076,6 +2081,11 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
         if self.speculative_algorithm == "JACOBI":
+            if not self.disable_overlap_schedule:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because JACOBI speculative decoding does not support overlap schedule."
+                )
             allowed_prefixes = (
                 "Qwen2",
                 "Qwen3",
