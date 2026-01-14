@@ -399,15 +399,18 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none():
+        use_spec = not batch.spec_algorithm.is_none() and not result.force_disable_spec
+        use_eagle_v2 = use_spec and batch.is_eagle_v2
+
+        if not use_spec:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        elif batch.is_eagle_v2:
+        elif use_eagle_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if use_spec:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
@@ -425,18 +428,26 @@ class SchedulerOutputProcessorMixin:
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # (currently not, e.g. Eagle V1 still check finish during forward)
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                if use_spec and req.finished():
+                    if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                        # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            release_kv_cache(req, self.tree_cache)
+                    else:
+                        release_kv_cache(req, self.tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            if not use_spec:
                 req.output_ids.append(next_token_id)
-            elif batch.is_eagle_v2:
+            elif use_eagle_v2:
                 # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
             # Update Mamba last track seqlen
-            self._mamba_prefix_cache_update(req, batch, result, i)
+            self._mamba_prefix_cache_update(req, batch, result, i, use_spec)
 
             req.check_finished(new_accepted_len)
 
@@ -450,7 +461,7 @@ class SchedulerOutputProcessorMixin:
 
                 req.time_stats.completion_time = time.perf_counter()
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
+            if req.return_logprob and not use_spec:
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -477,10 +488,10 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if batch.spec_algorithm.is_none():
+                    if not use_spec:
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
-                    elif batch.is_eagle_v2:
+                    elif use_eagle_v2:
                         # Speculative decode: next_token_id is a list of accepted tokens
                         for token_id in next_token_id:
                             req.grammar.accept_token(token_id)
@@ -504,19 +515,21 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
     def _mamba_prefix_cache_update(
-        self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
+        self,
+        req: Req,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        i: int,
+        use_spec: bool,
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval
-            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
+            if not use_spec and seq_len % mamba_track_interval == 0:
                 # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
                 req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
                 req.mamba_last_track_seqlen = seq_len
-            elif (
-                not batch.spec_algorithm.is_none()
-                and result.accept_length_per_req_cpu is not None
-            ):
+            elif use_spec and result.accept_length_per_req_cpu is not None:
                 # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
                 actual_seq_len = req.seqlen - 1
                 if (

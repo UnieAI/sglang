@@ -28,6 +28,7 @@ class GenerationBatchResult:
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
+    force_disable_spec: bool = False
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
