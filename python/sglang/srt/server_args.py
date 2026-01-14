@@ -448,6 +448,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_max_batch_size: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -2046,16 +2047,19 @@ class ServerArgs:
                 raise ValueError(
                     "Ngram speculative decoding only supports CUDA device."
                 )
-            if not self.disable_overlap_schedule:
-                self.disable_overlap_schedule = True
-                logger.warning(
-                    "Overlap scheduler is disabled because NGRAM speculative decoding does not support overlap schedule."
-                )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            if (
+                self.speculative_ngram_max_batch_size is not None
+                and self.speculative_ngram_max_batch_size < 0
+            ):
+                raise ValueError(
+                    "speculative_ngram_max_batch_size must be >= 0 when set."
                 )
 
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
@@ -3513,6 +3517,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-batch-size",
+            type=int,
+            default=ServerArgs.speculative_ngram_max_batch_size,
+            help=(
+                "Enable ngram speculative decoding only when batch size is less than "
+                "or equal to this value. If unset, ngram speculative decoding is "
+                "always enabled."
+            ),
         )
 
         # Expert parallelism

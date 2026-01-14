@@ -1994,7 +1994,28 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
+                if self.spec_algorithm.is_ngram():
+                    if self.running_batch.output_ids is None:
+                        last_token_ids = [
+                            (
+                                req.output_ids[-1]
+                                if req.output_ids
+                                else req.origin_input_ids[-1]
+                            )
+                            for req in self.running_batch.reqs
+                        ]
+                        self.running_batch.output_ids = torch.tensor(
+                            last_token_ids,
+                            dtype=torch.int64,
+                            device=self.running_batch.seq_lens.device,
+                        )
+                    original_spec_algorithm = self.running_batch.spec_algorithm
+                    self.running_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                    self.running_batch.prepare_for_decode()
+                    self.running_batch.spec_algorithm = original_spec_algorithm
+                    self.running_batch.spec_info = None
+                else:
+                    self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(

@@ -62,6 +62,49 @@ class NGRAMWorker:
     def clear_cache_pool(self):
         self.ngram_cache.reset()
 
+    def _use_ngram_for_decode(self, batch: ScheduleBatch) -> bool:
+        if not batch.forward_mode.is_decode():
+            return True
+        max_bs = self.model_runner.server_args.speculative_ngram_max_batch_size
+        if max_bs is None:
+            return True
+        if max_bs < 1:
+            return False
+        return batch.batch_size() <= max_bs
+
+    def _get_last_token_ids(self, batch: ScheduleBatch) -> torch.Tensor:
+        device = batch.seq_lens.device
+        last_token_ids = [
+            req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+            for req in batch.reqs
+        ]
+        return torch.tensor(last_token_ids, dtype=torch.int64, device=device)
+
+    def _prepare_non_spec_decode_batch(self, batch: ScheduleBatch) -> None:
+        if not batch.forward_mode.is_decode():
+            return
+        if batch.output_ids is None:
+            batch.output_ids = self._get_last_token_ids(batch)
+        original_spec_algorithm = batch.spec_algorithm
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        batch.prepare_for_decode()
+        batch.spec_algorithm = original_spec_algorithm
+        batch.spec_info = None
+
+    def _update_ngram_cache_with_next_tokens(
+        self, batch: ScheduleBatch, next_token_ids: torch.Tensor
+    ) -> None:
+        if next_token_ids is None:
+            return
+        next_tokens = next_token_ids.tolist()
+        batch_tokens = []
+        for req, next_token in zip(batch.reqs, next_tokens, strict=True):
+            put_ids = self._efficient_concat_last_n(
+                req.origin_input_ids, req.output_ids + [next_token], self.branch_length
+            )
+            batch_tokens.append(put_ids)
+        self.ngram_cache.batch_put(batch_tokens)
+
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
         if seq2_len >= n:
@@ -292,6 +335,18 @@ class NGRAMWorker:
         self.ngram_cache.batch_put(batch_tokens)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        if batch.forward_mode.is_decode() and not self._use_ngram_for_decode(batch):
+            self._prepare_non_spec_decode_batch(batch)
+            model_worker_batch = batch.get_model_worker_batch()
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch
+            )
+            batch_result.force_disable_spec = True
+            self._update_ngram_cache_with_next_tokens(
+                batch, batch_result.next_token_ids
+            )
+            return batch_result
+
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
@@ -315,6 +370,7 @@ class NGRAMWorker:
                 self.add_logprob_values(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
             batch.forward_mode = ForwardMode.DECODE
+            next_token_ids = self._get_last_token_ids(batch)
 
         else:
             batch_result = self.target_worker.forward_batch_generation(
