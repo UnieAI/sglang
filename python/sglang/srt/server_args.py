@@ -449,6 +449,13 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     speculative_ngram_max_batch_size: Optional[int] = None
+    speculative_ngram_accept_rate_low: Optional[float] = None
+    speculative_ngram_accept_rate_high: Optional[float] = None
+    speculative_ngram_accept_rate_ema_decay: float = 0.9
+    speculative_ngram_accept_rate_warmup: int = 0
+    speculative_ngram_accept_rate_probe_interval: int = 0
+    speculative_ngram_max_seq_len: Optional[int] = None
+    speculative_ngram_max_new_tokens: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -2061,6 +2068,69 @@ class ServerArgs:
                 raise ValueError(
                     "speculative_ngram_max_batch_size must be >= 0 when set."
                 )
+            if not 0.0 <= self.speculative_ngram_accept_rate_ema_decay <= 1.0:
+                raise ValueError(
+                    "speculative_ngram_accept_rate_ema_decay must be between 0 and 1."
+                )
+            if self.speculative_ngram_accept_rate_warmup < 0:
+                raise ValueError(
+                    "speculative_ngram_accept_rate_warmup must be >= 0."
+                )
+            if self.speculative_ngram_accept_rate_probe_interval < 0:
+                raise ValueError(
+                    "speculative_ngram_accept_rate_probe_interval must be >= 0."
+                )
+            if (
+                self.speculative_ngram_max_seq_len is not None
+                and self.speculative_ngram_max_seq_len < 1
+            ):
+                raise ValueError(
+                    "speculative_ngram_max_seq_len must be >= 1 when set."
+                )
+            if (
+                self.speculative_ngram_max_new_tokens is not None
+                and self.speculative_ngram_max_new_tokens < 0
+            ):
+                raise ValueError(
+                    "speculative_ngram_max_new_tokens must be >= 0 when set."
+                )
+            if (
+                self.speculative_ngram_accept_rate_low is not None
+                and not 0.0 <= self.speculative_ngram_accept_rate_low <= 1.0
+            ):
+                raise ValueError(
+                    "speculative_ngram_accept_rate_low must be between 0 and 1."
+                )
+            if (
+                self.speculative_ngram_accept_rate_high is not None
+                and not 0.0 <= self.speculative_ngram_accept_rate_high <= 1.0
+            ):
+                raise ValueError(
+                    "speculative_ngram_accept_rate_high must be between 0 and 1."
+                )
+            if (
+                self.speculative_ngram_accept_rate_low is None
+                and self.speculative_ngram_accept_rate_high is not None
+            ):
+                self.speculative_ngram_accept_rate_low = (
+                    self.speculative_ngram_accept_rate_high
+                )
+            if (
+                self.speculative_ngram_accept_rate_high is None
+                and self.speculative_ngram_accept_rate_low is not None
+            ):
+                self.speculative_ngram_accept_rate_high = (
+                    self.speculative_ngram_accept_rate_low
+                )
+            if (
+                self.speculative_ngram_accept_rate_low is not None
+                and self.speculative_ngram_accept_rate_high is not None
+                and self.speculative_ngram_accept_rate_high
+                < self.speculative_ngram_accept_rate_low
+            ):
+                raise ValueError(
+                    "speculative_ngram_accept_rate_high must be >= speculative_ngram_accept_rate_low."
+                )
 
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
@@ -3526,6 +3596,67 @@ class ServerArgs:
                 "Enable ngram speculative decoding only when batch size is less than "
                 "or equal to this value. If unset, ngram speculative decoding is "
                 "always enabled."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-accept-rate-low",
+            type=float,
+            default=ServerArgs.speculative_ngram_accept_rate_low,
+            help=(
+                "Disable ngram speculative decoding when the EMA accept rate is below "
+                "this value. If unset, accept-rate gating is disabled."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-accept-rate-high",
+            type=float,
+            default=ServerArgs.speculative_ngram_accept_rate_high,
+            help=(
+                "Re-enable ngram speculative decoding when the EMA accept rate is "
+                "greater than or equal to this value. Defaults to the low threshold "
+                "when not set."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-accept-rate-ema-decay",
+            type=float,
+            default=ServerArgs.speculative_ngram_accept_rate_ema_decay,
+            help="EMA decay for ngram accept-rate gating. 0 uses latest value only.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-accept-rate-warmup",
+            type=int,
+            default=ServerArgs.speculative_ngram_accept_rate_warmup,
+            help=(
+                "Number of speculative decode samples to observe before applying "
+                "accept-rate gating."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-accept-rate-probe-interval",
+            type=int,
+            default=ServerArgs.speculative_ngram_accept_rate_probe_interval,
+            help=(
+                "When accept-rate gate is closed, allow one probe step every N decode "
+                "steps to refresh EMA. 0 disables probing."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-seq-len",
+            type=int,
+            default=ServerArgs.speculative_ngram_max_seq_len,
+            help=(
+                "Disable ngram speculative decoding when the max decode sequence "
+                "length in the batch is >= this value."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-new-tokens",
+            type=int,
+            default=ServerArgs.speculative_ngram_max_new_tokens,
+            help=(
+                "Disable ngram speculative decoding when any request has "
+                "max_new_tokens > this value."
             ),
         )
 
