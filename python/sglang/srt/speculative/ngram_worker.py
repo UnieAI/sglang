@@ -65,12 +65,24 @@ class NGRAMWorker:
     def _use_ngram_for_decode(self, batch: ScheduleBatch) -> bool:
         if not batch.forward_mode.is_decode():
             return True
-        max_bs = self.model_runner.server_args.speculative_ngram_max_batch_size
-        if max_bs is None:
-            return True
-        if max_bs < 1:
-            return False
-        return batch.batch_size() <= max_bs
+        server_args = self.model_runner.server_args
+        max_bs = server_args.speculative_ngram_max_batch_size
+        if max_bs is not None:
+            if max_bs < 1:
+                return False
+            if batch.batch_size() > max_bs:
+                return False
+        max_seq_len = server_args.speculative_ngram_max_seq_len
+        if max_seq_len is not None:
+            max_seq = int(batch.seq_lens_cpu.max().item())
+            if max_seq >= max_seq_len:
+                return False
+        max_new_tokens = server_args.speculative_ngram_max_new_tokens
+        if max_new_tokens is not None:
+            for req in batch.reqs:
+                if req.sampling_params.max_new_tokens > max_new_tokens:
+                    return False
+        return True
 
     def _get_last_token_ids(self, batch: ScheduleBatch) -> torch.Tensor:
         device = batch.seq_lens.device

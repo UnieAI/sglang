@@ -412,6 +412,8 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
         if use_spec:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            if batch.spec_algorithm.is_ngram():
+                self._update_ngram_accept_rate_state(batch, result)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 

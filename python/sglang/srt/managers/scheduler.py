@@ -299,6 +299,10 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
+        self.ngram_accept_rate_ema = None
+        self.ngram_accept_rate_samples = 0
+        self.ngram_accept_rate_gate_open = True
+        self.ngram_accept_rate_probe_steps = 0
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
@@ -2157,6 +2161,91 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _ngram_accept_rate_gate_enabled(self) -> bool:
+        return (
+            self.server_args.speculative_ngram_accept_rate_low is not None
+            or self.server_args.speculative_ngram_accept_rate_high is not None
+        )
+
+    def _update_ngram_accept_rate_state(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        if not self.spec_algorithm.is_ngram():
+            return
+        if not self._ngram_accept_rate_gate_enabled():
+            return
+        if not batch.forward_mode.is_decode():
+            return
+        if result.force_disable_spec:
+            return
+        num_draft_tokens = self.server_args.speculative_num_draft_tokens or 0
+        if num_draft_tokens < 1:
+            return
+        bs = batch.batch_size()
+        if bs < 1:
+            return
+        accept_rate = (result.num_accepted_tokens + bs) / (bs * num_draft_tokens)
+        decay = self.server_args.speculative_ngram_accept_rate_ema_decay
+        if self.ngram_accept_rate_ema is None:
+            self.ngram_accept_rate_ema = accept_rate
+        else:
+            self.ngram_accept_rate_ema = (
+                decay * self.ngram_accept_rate_ema + (1.0 - decay) * accept_rate
+            )
+        self.ngram_accept_rate_samples += bs
+        warmup = self.server_args.speculative_ngram_accept_rate_warmup
+        if self.ngram_accept_rate_samples < warmup:
+            return
+        low = self.server_args.speculative_ngram_accept_rate_low
+        high = self.server_args.speculative_ngram_accept_rate_high
+        if low is None and high is None:
+            return
+        if self.ngram_accept_rate_gate_open:
+            if low is not None and self.ngram_accept_rate_ema < low:
+                self.ngram_accept_rate_gate_open = False
+        else:
+            threshold = high if high is not None else low
+            if threshold is not None and self.ngram_accept_rate_ema >= threshold:
+                self.ngram_accept_rate_gate_open = True
+
+    def _ngram_accept_rate_allows(self) -> bool:
+        if not self._ngram_accept_rate_gate_enabled():
+            return True
+        if self.ngram_accept_rate_gate_open:
+            self.ngram_accept_rate_probe_steps = 0
+            return True
+        probe_interval = self.server_args.speculative_ngram_accept_rate_probe_interval
+        if probe_interval < 1:
+            return False
+        self.ngram_accept_rate_probe_steps += 1
+        if self.ngram_accept_rate_probe_steps >= probe_interval:
+            self.ngram_accept_rate_probe_steps = 0
+            return True
+        return False
+
+    def _should_use_ngram_for_decode(self, batch: ScheduleBatch) -> bool:
+        if not batch.forward_mode.is_decode():
+            return True
+        max_bs = self.server_args.speculative_ngram_max_batch_size
+        if max_bs is not None:
+            if max_bs < 1:
+                return False
+            if batch.batch_size() > max_bs:
+                return False
+        max_seq_len = self.server_args.speculative_ngram_max_seq_len
+        if max_seq_len is not None:
+            max_seq = int(batch.seq_lens_cpu.max().item())
+            if max_seq >= max_seq_len:
+                return False
+        max_new_tokens = self.server_args.speculative_ngram_max_new_tokens
+        if max_new_tokens is not None:
+            for req in batch.reqs:
+                if req.sampling_params.max_new_tokens > max_new_tokens:
+                    return False
+        if not self._ngram_accept_rate_allows():
+            return False
+        return True
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2183,7 +2272,18 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
+            use_ngram = False
+            use_overlap = self.enable_overlap
+            ngram_bypass = False
+            if self.spec_algorithm.is_ngram():
+                use_overlap = False
+                if batch.forward_mode.is_decode():
+                    use_ngram = self._should_use_ngram_for_decode(batch)
+                    ngram_bypass = not use_ngram
+                    if ngram_bypass:
+                        use_overlap = self.enable_overlap
+
+            if self.spec_algorithm.is_none() or use_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
@@ -2191,25 +2291,57 @@ class Scheduler(
                 # TODO(lsyin): delete this branch after unifying the abstraction.
                 worker_batch_or_batch = batch
 
-            if self.enable_overlap:
+            if use_overlap:
                 model_worker_batch = worker_batch_or_batch
-                self.record_batch_in_overlap(model_worker_batch)
+                if ngram_bypass and hasattr(
+                    self.draft_worker, "_prepare_non_spec_decode_batch"
+                ):
+                    self.draft_worker._prepare_non_spec_decode_batch(batch)
+                    model_worker_batch = batch.get_model_worker_batch()
 
                 # Sampling info will be modified during forward, so we store a copy.
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
 
+                self.record_batch_in_overlap(model_worker_batch)
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
-                        # here pp is not compatible with overlap
-                    )
+                    if ngram_bypass:
+                        batch_result = self.tp_worker.forward_batch_generation(
+                            model_worker_batch
+                            # here pp is not compatible with overlap
+                        )
+                        batch_result.force_disable_spec = True
+                        if hasattr(
+                            self.draft_worker, "_update_ngram_cache_with_next_tokens"
+                        ):
+                            if batch_result.delay_sample_func is None:
+                                self.draft_worker._update_ngram_cache_with_next_tokens(
+                                    batch, batch_result.next_token_ids
+                                )
+                            else:
+                                original_delay_sample_func = batch_result.delay_sample_func
+
+                                def delay_sample_func_with_cache():
+                                    res = original_delay_sample_func()
+                                    self.draft_worker._update_ngram_cache_with_next_tokens(
+                                        batch, batch_result.next_token_ids
+                                    )
+                                    return res
+
+                                batch_result.delay_sample_func = (
+                                    delay_sample_func_with_cache
+                                )
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            model_worker_batch
+                            # here pp is not compatible with overlap
+                        )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -2245,9 +2377,25 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                batch_result = self.model_worker.forward_batch_generation(
-                    worker_batch_or_batch, **kwargs
-                )
+                if ngram_bypass and hasattr(
+                    self.draft_worker, "_prepare_non_spec_decode_batch"
+                ):
+                    self.draft_worker._prepare_non_spec_decode_batch(batch)
+                    model_worker_batch = batch.get_model_worker_batch()
+                    batch_result = self.tp_worker.forward_batch_generation(
+                        model_worker_batch, **kwargs
+                    )
+                    batch_result.force_disable_spec = True
+                    if hasattr(
+                        self.draft_worker, "_update_ngram_cache_with_next_tokens"
+                    ):
+                        self.draft_worker._update_ngram_cache_with_next_tokens(
+                            batch, batch_result.next_token_ids
+                        )
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        worker_batch_or_batch, **kwargs
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
