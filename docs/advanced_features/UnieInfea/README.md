@@ -59,30 +59,29 @@ NGRAM speculative decoding can provide significant speedups at low batch sizes a
 
 ### Latest News
 
-- **2026-01-18**: Complete Documentation Overhaul - Addressing User Configuration Challenges
+- **2026-01-18**: UnieInfra Dynamic Strategy Controller (DSC) Full Implementation
 
-  **Problem Context**:
-  - Original documentation was disorganized with scattered information
-  - Parameter descriptions were too brief, users unclear on threshold tuning
-  - Lack of practical examples created gap between theory and practice
-  - Insufficient troubleshooting guidance made self-service debugging difficult
+  **Core Features**:
+  - ✅ **NGRAM Dynamic Routing**: Intelligent per-decode-step decision making for NGRAM speculative decoding
+  - ✅ **Multi-Gate Mechanism**: Four composable gates - batch size, sequence length, output length, accept-rate EMA
+  - ✅ **Accept-Rate Adaptation**: EMA + hysteresis mechanism for automatic workload quality adaptation
+  - ✅ **Probing Mechanism**: Periodic probing when gate is closed to detect condition improvements and auto-reactivate
+  - ✅ **Zero-Overhead Fallback**: Uses native decode path during bypass, no additional overhead
+  - ✅ **PD Disaggregation Compatible**: Fully compatible with Prefill/Decode disaggregation
+  - ✅ **LMCache Integration**: Orthogonal usage with LMCache hierarchical caching
 
-  **Improvements Delivered**:
-  - ✅ **Added "Parameter Quick Reference"**: Comprehensive parameter tables covering SGLang basics, NGRAM parameters, and all DSC gate parameters with descriptions, suggested values, and use cases
-  - ✅ **Expanded "Configuration Guide"**: Each gate now has detailed purpose explanation, operation mechanism, usage scenarios, and example configurations
-  - ✅ **Added "Preset Configurations"**: Two template configurations - "Optimized Baseline" and "Clean Baseline"
-  - ✅ **Added "Usage Examples"**: 5 real-world examples from minimal to full configuration, covering RAG, code generation, chat scenarios
-  - ✅ **Added "Understanding Gates"**: Deep dive into why NGRAM can be slower, gate trigger conditions, step-by-step tuning strategy
-  - ✅ **Added "Troubleshooting"**: 4 common issues with symptoms, causes, and solutions
-  - ✅ **Expanded FAQ**: Increased from 4 to 8 frequently asked questions
-  - ✅ **Added "Performance Tips"**: Recommended configurations for different workloads, common pitfalls, monitoring suggestions
+  **Problems Solved**:
+  - 🎯 NGRAM performance degradation at high concurrency → batch size gate auto-switches
+  - 🎯 Slowdown from low acceptance rates → accept-rate EMA gate monitors dynamically
+  - 🎯 Memory pressure from long sequences → seq len gate limits usage scenarios
+  - 🎯 Low hit rates for long outputs → output len gate provides precise control
+  - 🎯 Variable workload quality → adaptive mechanism adjusts automatically
 
-  **Expected Impact**:
-  - 🎯 New users can complete basic setup and run in 5 minutes
-  - 🎯 Production users can select optimal configurations based on workload characteristics
-  - 🎯 Reduce performance issues caused by improper parameter settings
-  - 🎯 Lower support burden - users can self-resolve 80% of common issues
-  - 🎯 English and Chinese documentation fully synchronized with 100% content consistency
+  **Expected Improvements**:
+  - 📈 Preserve low batch size NGRAM speedup (2-3x token generation)
+  - 📈 Avoid throughput degradation at high concurrency (maintain standard decode performance)
+  - 📈 Dynamic switching without restart (millisecond-level decision latency)
+  - 📈 Adapt to various workloads (RAG, code generation, dialogue, etc.)
 
 ## Quick Start
 
