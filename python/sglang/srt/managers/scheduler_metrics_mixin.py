@@ -297,7 +297,7 @@ class SchedulerMetricsMixin:
             spec_accept_rate = 0
         else:
             spec_accept_length = (
-                self.spec_num_accepted_tokens / self.spec_num_forward_ct
+                self.spec_num_accepted_tokens / self.spec_num_forward_ct if self.spec_num_forward_ct > 0 else 0.0
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
             draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
@@ -425,6 +425,16 @@ class SchedulerMetricsMixin:
                     self.stats.token_usage / 0.9,
                 )
 
+    def _collect_waiting_queues(self: Scheduler):
+        waiting_queues = [self.waiting_queue]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
+            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
+            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+        return waiting_queues
+
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
         if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
@@ -435,14 +445,7 @@ class SchedulerMetricsMixin:
             num_tokens = self._get_token_info()[0]
 
         # Tokens in waiting queue, bootstrap queue, prealloc queue
-        waiting_queues = [self.waiting_queue]
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
-            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
-            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
-
+        waiting_queues = self._collect_waiting_queues()
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
