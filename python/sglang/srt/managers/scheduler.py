@@ -303,6 +303,7 @@ class Scheduler(
         self.ngram_accept_rate_samples = 0
         self.ngram_accept_rate_gate_open = True
         self.ngram_accept_rate_probe_steps = 0
+        self.ngram_waiting_running_gate_open = True
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
@@ -2223,6 +2224,30 @@ class Scheduler(
             return True
         return False
 
+    def _ngram_waiting_running_ratio_allows(self) -> bool:
+        high = self.server_args.speculative_ngram_waiting_running_ratio_high
+        low = self.server_args.speculative_ngram_waiting_running_ratio_low
+        max_con = self.server_args.speculative_ngram_max_concurrency
+        if high is None and low is None:
+            return True
+
+        running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        if running <= 0:
+            return True
+        if max_con is None:
+            max_con = running
+
+        ratio = (len(self.waiting_queue) + running) / min(max_con, running)
+        if self.ngram_waiting_running_gate_open:
+            if high is not None and ratio > high:
+                self.ngram_waiting_running_gate_open = False
+        else:
+            threshold = low if low is not None else high
+            if threshold is not None and ratio < threshold:
+                self.ngram_waiting_running_gate_open = True
+
+        return self.ngram_waiting_running_gate_open
+
     def _should_use_ngram_for_decode(self, batch: ScheduleBatch) -> bool:
         if not batch.forward_mode.is_decode():
             return True
@@ -2242,6 +2267,8 @@ class Scheduler(
             for req in batch.reqs:
                 if req.sampling_params.max_new_tokens > max_new_tokens:
                     return False
+        if not self._ngram_waiting_running_ratio_allows():
+            return False
         if not self._ngram_accept_rate_allows():
             return False
         return True
