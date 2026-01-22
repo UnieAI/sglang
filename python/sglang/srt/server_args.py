@@ -449,12 +449,15 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     speculative_ngram_max_batch_size: Optional[int] = None
+    speculative_ngram_waiting_running_ratio_high: float = 2.5
+    speculative_ngram_waiting_running_ratio_low: float = 1.8
     speculative_ngram_accept_rate_low: Optional[float] = None
     speculative_ngram_accept_rate_high: Optional[float] = None
     speculative_ngram_accept_rate_ema_decay: float = 0.9
     speculative_ngram_accept_rate_warmup: int = 0
     speculative_ngram_accept_rate_probe_interval: int = 0
     speculative_ngram_max_seq_len: Optional[int] = None
+    speculative_ngram_max_concurrency: Optional[int] = None
     speculative_ngram_max_new_tokens: Optional[int] = None
 
     # Expert parallelism
@@ -2068,6 +2071,21 @@ class ServerArgs:
                 raise ValueError(
                     "speculative_ngram_max_batch_size must be >= 0 when set."
                 )
+            if self.speculative_ngram_waiting_running_ratio_high < 0:
+                raise ValueError(
+                    "speculative_ngram_waiting_running_ratio_high must be >= 0."
+                )
+            if self.speculative_ngram_waiting_running_ratio_low < 0:
+                raise ValueError(
+                    "speculative_ngram_waiting_running_ratio_low must be >= 0."
+                )
+            if (
+                self.speculative_ngram_waiting_running_ratio_high
+                < self.speculative_ngram_waiting_running_ratio_low
+            ):
+                raise ValueError(
+                    "speculative_ngram_waiting_running_ratio_high must be >= speculative_ngram_waiting_running_ratio_low."
+                )
             if not 0.0 <= self.speculative_ngram_accept_rate_ema_decay <= 1.0:
                 raise ValueError(
                     "speculative_ngram_accept_rate_ema_decay must be between 0 and 1."
@@ -3599,6 +3617,24 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--speculative-ngram-waiting-running-ratio-high",
+            type=float,
+            default=ServerArgs.speculative_ngram_waiting_running_ratio_high,
+            help=(
+                "Disable ngram speculative decoding when waiting/running exceeds "
+                "this ratio."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-waiting-running-ratio-low",
+            type=float,
+            default=ServerArgs.speculative_ngram_waiting_running_ratio_low,
+            help=(
+                "Re-enable ngram speculative decoding when waiting/running falls below "
+                "this ratio."
+            ),
+        )
+        parser.add_argument(
             "--speculative-ngram-accept-rate-low",
             type=float,
             default=ServerArgs.speculative_ngram_accept_rate_low,
@@ -3654,6 +3690,15 @@ class ServerArgs:
             "--speculative-ngram-max-new-tokens",
             type=int,
             default=ServerArgs.speculative_ngram_max_new_tokens,
+            help=(
+                "Disable ngram speculative decoding when any request has "
+                "max_new_tokens > this value."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-concurrency",
+            type=int,
+            default=ServerArgs.speculative_ngram_max_concurrency,
             help=(
                 "Disable ngram speculative decoding when any request has "
                 "max_new_tokens > this value."
