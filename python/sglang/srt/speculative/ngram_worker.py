@@ -196,62 +196,147 @@ class NGRAMWorker:
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
+    def _max_draft_token_num_for_batch(self, batch: ScheduleBatch) -> int:
+        bs = batch.batch_size()
+        if bs == 0:
+            return self.draft_token_num
+
+        tree_cache = batch.tree_cache
+        if tree_cache is None:
+            return self.draft_token_num
+
+        allocator = tree_cache.token_to_kv_pool_allocator
+        if hasattr(allocator, "full_available_size"):
+            full_available = (
+                allocator.full_available_size() + tree_cache.full_evictable_size()
+            )
+            swa_available = (
+                allocator.swa_available_size() + tree_cache.swa_evictable_size()
+            )
+            available_tokens = min(full_available, swa_available)
+        else:
+            available_tokens = allocator.available_size() + tree_cache.evictable_size()
+
+        return min(self.draft_token_num, available_tokens // bs)
+
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch) -> bool:
         if batch.forward_mode.is_extend():
-            return
+            return True
 
         bs = batch.batch_size()
-
-        retrive_index = self.retrieve_indexes_batch[bs]
-        retrive_next_token = self.retrive_next_token_batch[bs]
-        retrive_next_sibling = self.retrive_next_sibling_batch[bs]
-        positions = self.positions_batch[bs]
-        tree_mask = self.tree_mask_batch[bs]
-        draft_tokens = self.draft_tokens_batch[bs]
-
-        req_drafts, mask = self._prepare_draft_tokens(batch)
-        tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
-        draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
-
-        reconstruct_indices_from_tree_mask(
-            tree_mask,
-            batch.seq_lens,
-            positions,  # mutable
-            retrive_index,  # mutable
-            retrive_next_token,  # mutable
-            retrive_next_sibling,  # mutable
-            bs,
-            self.draft_token_num,
-        )
-
-        # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
-        # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK:
-            tree_mask = []
-            mask = mask.reshape(
-                batch.batch_size(), self.draft_token_num, self.draft_token_num
+        max_draft_token_num = self._max_draft_token_num_for_batch(batch)
+        if max_draft_token_num < 1:
+            logger.warning(
+                "NGRAM verify skipped due to KV cache OOM; no draft tokens available."
             )
-            for i, req in enumerate(batch.reqs):
-                seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                req_mask = torch.ones((self.draft_token_num, seq_len - 1)).cuda()
-                req_mask = torch.cat(
-                    (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+            self._prepare_non_spec_decode_batch(batch)
+            batch.spec_info = None
+            return False
 
-        batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.spec_info = NgramVerifyInput(
-            draft_tokens,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            self.draft_token_num,
+        retrive_index_full = self.retrieve_indexes_batch[bs]
+        retrive_next_token_full = self.retrive_next_token_batch[bs]
+        retrive_next_sibling_full = self.retrive_next_sibling_batch[bs]
+        positions_full = self.positions_batch[bs]
+        tree_mask_full = self.tree_mask_batch[bs]
+        draft_tokens_full = self.draft_tokens_batch[bs]
+
+        req_drafts_full, mask_full = self._prepare_draft_tokens(batch)
+        max_draft_token_num = min(self.draft_token_num, max_draft_token_num)
+        if max_draft_token_num < self.draft_token_num:
+            logger.warning(
+                "NGRAM draft_token_num reduced from %d to %d due to KV cache pressure.",
+                self.draft_token_num,
+                max_draft_token_num,
+            )
+
+        for draft_token_num in range(max_draft_token_num, 0, -1):
+            if draft_token_num == self.draft_token_num:
+                req_drafts = req_drafts_full
+                mask = mask_full
+            else:
+                req_drafts = (
+                    req_drafts_full.reshape(bs, self.draft_token_num)[:, :draft_token_num]
+                    .reshape(-1)
+                    .copy()
+                )
+                mask = (
+                    mask_full.reshape(bs, self.draft_token_num, self.draft_token_num)[
+                        :, :draft_token_num, :draft_token_num
+                    ]
+                    .reshape(-1)
+                    .copy()
+                )
+
+            retrive_index = retrive_index_full[:, :draft_token_num]
+            retrive_next_token = retrive_next_token_full[:, :draft_token_num]
+            retrive_next_sibling = retrive_next_sibling_full[:, :draft_token_num]
+            positions = positions_full[: bs * draft_token_num]
+            tree_mask = tree_mask_full[: bs * draft_token_num * draft_token_num]
+            draft_tokens = draft_tokens_full[: bs * draft_token_num]
+
+            tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
+            draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+
+            reconstruct_indices_from_tree_mask(
+                tree_mask,
+                batch.seq_lens,
+                positions,  # mutable
+                retrive_index,  # mutable
+                retrive_next_token,  # mutable
+                retrive_next_sibling,  # mutable
+                bs,
+                draft_token_num,
+            )
+
+            # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
+            # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
+            if USE_FULL_MASK:
+                tree_mask = []
+                mask = mask.reshape(
+                    batch.batch_size(), draft_token_num, draft_token_num
+                )
+                for i, req in enumerate(batch.reqs):
+                    seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                    req_mask = torch.ones((draft_token_num, seq_len - 1)).cuda()
+                    req_mask = torch.cat(
+                        (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
+                    ).to(torch.bool)
+                    tree_mask.append(req_mask.flatten())
+                tree_mask = torch.cat(tree_mask, dim=0)
+
+            spec_info = NgramVerifyInput(
+                draft_tokens,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_token_num,
+            )
+            try:
+                spec_info.prepare_for_verify(batch, self.page_size)
+            except RuntimeError as exc:
+                if "Out of memory." not in str(exc):
+                    raise
+                if draft_token_num == 1:
+                    break
+                logger.warning(
+                    "NGRAM verify OOM; retrying with draft_token_num=%d.",
+                    draft_token_num - 1,
+                )
+                continue
+
+            batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+            batch.spec_info = spec_info
+            return True
+
+        logger.warning(
+            "NGRAM verify skipped due to KV cache OOM; falling back to non-spec decode."
         )
-        batch.spec_info.prepare_for_verify(batch, self.page_size)
+        self._prepare_non_spec_decode_batch(batch)
+        batch.spec_info = None
+        return False
 
     def add_logprob_values(
         self,
@@ -359,7 +444,16 @@ class NGRAMWorker:
             )
             return batch_result
 
-        self._prepare_for_speculative_decoding(batch)
+        if not self._prepare_for_speculative_decoding(batch):
+            model_worker_batch = batch.get_model_worker_batch()
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch
+            )
+            batch_result.force_disable_spec = True
+            self._update_ngram_cache_with_next_tokens(
+                batch, batch_result.next_token_ids
+            )
+            return batch_result
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
         accept_lens = None
