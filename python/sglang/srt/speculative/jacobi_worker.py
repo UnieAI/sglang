@@ -34,7 +34,276 @@ class JacobiWorker:
         self.prefill_random = server_args.jacobi_prefill_random
         self.vocab_size = self.model_runner.model_config.vocab_size
 
-        logger.info("JacobiWorker initialized")
+        self._init_dsc()
+        logger.info("JacobiWorker initialized with DSC support")
+
+    def _init_dsc(self):
+        # DSC parameters
+        self.max_batch_size = self.server_args.jacobi_max_batch_size
+        self.accept_rate_low = self.server_args.jacobi_accept_rate_low
+        self.accept_rate_high = self.server_args.jacobi_accept_rate_high
+        self.ema_decay = self.server_args.jacobi_accept_rate_ema_decay
+        self.warmup_steps = self.server_args.jacobi_accept_rate_warmup
+        self.probe_interval = self.server_args.jacobi_accept_rate_probe_interval
+
+        # DSC state
+        self.current_ema = 1.0  # Optimistic initial value
+        self.step_counter = 0
+        self.gate_open = True
+        self.probe_counter = 0
+
+    def _use_jacobi_for_decode(self, batch) -> bool:
+        # 1. Batch size gate
+        if self.max_batch_size is not None and len(batch.reqs) > self.max_batch_size:
+            return False
+
+        # 2. Acceptance rate gate
+        # If low/high thresholds are not set, always open
+        if self.accept_rate_low is None:
+            return True
+
+        self.step_counter += 1
+
+        # Warmup period
+        if self.step_counter < self.warmup_steps:
+            return True
+
+        # Hysteresis logic
+        if self.gate_open:
+            if self.current_ema < self.accept_rate_low:
+                logger.info(f"[DSC] Closing Jacobi gate. EMA: {self.current_ema:.3f} < {self.accept_rate_low}")
+                self.gate_open = False
+        else:
+            if self.accept_rate_high is not None and self.current_ema > self.accept_rate_high:
+                logger.info(f"[DSC] Re-opening Jacobi gate. EMA: {self.current_ema:.3f} > {self.accept_rate_high}")
+                self.gate_open = True
+
+            # Probe logic
+            if not self.gate_open and self.probe_interval > 0:
+                self.probe_counter += 1
+                if self.probe_counter >= self.probe_interval:
+                    self.probe_counter = 0
+                    return True # One-shot probe
+
+        return self.gate_open
+
+    def _update_acceptance_rate(self, num_accepted: int, total_proposed: int):
+        if total_proposed == 0:
+            return
+
+        current_rate = num_accepted / total_proposed
+        self.current_ema = self.ema_decay * self.current_ema + (1.0 - self.ema_decay) * current_rate
+
+    def forward_batch_generation(
+        self,
+        model_worker_batch,
+        forward_batch: Optional[ForwardBatch] = None,
+        **_,
+    ) -> GenerationBatchResult:
+        if forward_batch is None:
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+
+        # === DSC Check ===
+        use_jacobi = self._use_jacobi_for_decode(model_worker_batch)
+
+        if not use_jacobi:
+            # Fallback to standard decode: Just 1 forward step with no draft/verify loop
+            # We can reuse the target_worker's logic or just call model_runner.forward once
+            logits_output, can_run_cuda_graph = self.model_runner.forward(
+                forward_batch, pp_proxy_tensors=None
+            )
+            # Standard decode usually returns 1 token.
+            # We need to construct result appropriately.
+            next_token_ids = torch.argmax(logits_output.next_token_logits, dim=-1)
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                can_run_cuda_graph=can_run_cuda_graph,
+                force_disable_spec=True # Marker for metrics
+            )
+        # =================
+
+        batch_size = len(model_worker_batch.reqs)
+        req_states = []
+
+        # Initialize per-request state
+        input_offset = 0
+        original_inputs = forward_batch.input_ids
+
+        for i, req in enumerate(model_worker_batch.reqs):
+            if model_worker_batch.extend_seq_lens:
+                extend_len = model_worker_batch.extend_seq_lens[i]
+            else:
+                extend_len = forward_batch.seq_lens[i].item()
+
+            prefix_len = len(req.prefix_indices)
+            stable_len = len(req.origin_input_ids) + len(req.output_ids)
+            stable_uncached_len = max(stable_len - prefix_len, 0)
+            draft_len = extend_len - stable_uncached_len
+            if draft_len <= 0:
+                draft_len = len(req.jacobi_draft_ids) or (self.block_size * self.num_blocks)
+
+            # Extract stable prefix for this request
+            stable_prefix = None
+            if stable_uncached_len > 0:
+                # Ensure we slice from the *original* input properly
+                # We assume forward_batch.input_ids has correct layout [req1, req2...]
+                stable_prefix = original_inputs[input_offset : input_offset + stable_uncached_len].clone()
+
+            input_offset += extend_len
+
+            # Initialize draft
+            draft_ids = req.jacobi_draft_ids
+            if not draft_ids:
+                if self.prefill_random and self.vocab_size > 0:
+                    draft_ids = torch.randint(
+                        0, self.vocab_size, (draft_len,), device=self.device
+                    ).tolist()
+                else:
+                    last_token = (
+                        req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+                    )
+                    draft_ids = [last_token] * draft_len
+            elif len(draft_ids) != draft_len:
+                if len(draft_ids) > draft_len:
+                    draft_ids = draft_ids[:draft_len]
+                else:
+                    last_token = draft_ids[-1]
+                    draft_ids = draft_ids + [last_token] * (draft_len - len(draft_ids))
+
+            draft_tensor = torch.tensor(draft_ids, dtype=torch.long, device=self.device)
+
+            req_states.append({
+                "req": req,
+                "draft_len": draft_len,
+                "stable_uncached_len": stable_uncached_len,
+                "stable_prefix": stable_prefix,
+                "new_draft": draft_tensor,
+                "accepted_ids": torch.empty((0,), dtype=torch.long, device=self.device),
+                "bootstrap": req.jacobi_needs_bootstrap
+            })
+
+        can_run_cuda_graph = False
+        logits_output = None
+        steps = max(self.steps_per_yield, 1)
+
+        # Metrics for DSC
+        total_accepted_tokens = 0
+        total_drafted_tokens = 0
+
+        for _ in range(steps):
+            # Construct batched inputs
+            batch_inputs = []
+            for state in req_states:
+                if state["stable_prefix"] is None:
+                    batch_inputs.append(state["new_draft"])
+                else:
+                    batch_inputs.append(torch.cat([state["stable_prefix"], state["new_draft"]], dim=0))
+
+            batched_input_tensor = torch.cat(batch_inputs, dim=0)
+
+            if forward_batch.input_ids.numel() == batched_input_tensor.numel():
+                forward_batch.input_ids.copy_(batched_input_tensor)
+            else:
+                forward_batch.input_ids = batched_input_tensor
+
+            logits_output, can_run_cuda_graph = self.model_runner.forward(
+                forward_batch, pp_proxy_tensors=None
+            )
+
+            logits = logits_output.full_logits
+            if logits is None:
+                raise RuntimeError("Jacobi requires full_logits but got None.")
+            if logits.dim() == 3:
+                logits = logits[0]
+
+            # Process each request's logits
+            logit_offset = 0
+            for state in req_states:
+                req = state["req"]
+                draft_len = state["draft_len"]
+                total_len = state["stable_uncached_len"] + draft_len
+
+                # Slice logits for this request
+                req_logits = logits[logit_offset : logit_offset + total_len]
+                logit_offset += total_len
+
+                draft_logits = req_logits[-draft_len:] if draft_len > 0 else req_logits
+
+                if state["bootstrap"]:
+                    state["new_draft"] = torch.argmax(draft_logits, dim=-1)
+                    state["accepted_ids"] = torch.empty((0,), dtype=torch.long, device=self.device)
+                    state["bootstrap"] = False
+                    continue
+
+                current_draft = state["new_draft"]
+                had_rejection = False
+
+                if current_draft.numel() < 2:
+                    state["accepted_ids"] = current_draft
+                    next_token = torch.argmax(draft_logits[-1], dim=-1)
+                    state["new_draft"] = next_token.view(1)
+                    total_accepted_tokens += current_draft.numel()
+                else:
+                    greedy_tokens = torch.argmax(draft_logits[:-1], dim=-1)
+                    mismatch = current_draft[1:] != greedy_tokens
+                    accepted_len = int((mismatch.cumsum(0) == 0).sum().item()) + 1
+                    state["accepted_ids"] = current_draft[:accepted_len]
+
+                    total_accepted_tokens += accepted_len
+
+                    had_rejection = accepted_len < current_draft.numel()
+
+                    next_token = torch.argmax(draft_logits[accepted_len - 1], dim=-1)
+                    if accepted_len < current_draft.numel():
+                        tail_logits = draft_logits[accepted_len:-1]
+                        if tail_logits.numel() > 0:
+                            greedy_tail = torch.argmax(tail_logits, dim=-1)
+                            state["new_draft"] = torch.cat([next_token.view(1), greedy_tail], dim=0)
+                        else:
+                            state["new_draft"] = next_token.view(1)
+                    else:
+                        state["new_draft"] = next_token.view(1)
+
+                pool_tail = self._select_ngram_tail(req, draft_len - 1)
+                if had_rejection and pool_tail is not None:
+                    state["new_draft"] = torch.tensor(
+                        [int(next_token.item())] + pool_tail,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+
+                if state["new_draft"].numel() < draft_len:
+                    pad_len = draft_len - state["new_draft"].numel()
+                    pad_token = state["new_draft"][-1]
+                    pad_tokens = pad_token.repeat(pad_len)
+                    state["new_draft"] = torch.cat([state["new_draft"], pad_tokens], dim=0)
+                elif state["new_draft"].numel() > draft_len:
+                    state["new_draft"] = state["new_draft"][:draft_len]
+
+                if self.ngram_pool_size > 0:
+                    self._append_ngram_pool(req, state["new_draft"].tolist())
+
+                total_drafted_tokens += draft_len # Approximation, per step
+
+        # Update DSC Stats
+        if self.accept_rate_low is not None:
+            self._update_acceptance_rate(total_accepted_tokens, total_drafted_tokens)
+
+        # Aggregate results
+        all_next_token_ids = []
+        all_draft_ids = []
+
+        for state in req_states:
+            all_next_token_ids.append(state["accepted_ids"])
+            all_draft_ids.append(state["new_draft"])
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=torch.cat(all_next_token_ids, dim=0),
+            draft_ids=torch.cat(all_draft_ids, dim=0),
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
 
     def _append_ngram_pool(self, req, tokens):
         if self.ngram_pool_size <= 0:
@@ -67,62 +336,85 @@ class JacobiWorker:
         if forward_batch is None:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
-        if not model_worker_batch.reqs or len(model_worker_batch.reqs) != 1:
-            raise ValueError("Jacobi MVP expects batch size = 1.")
+        batch_size = len(model_worker_batch.reqs)
+        req_states = []
 
-        req = model_worker_batch.reqs[0]
-        extend_len = (
-            model_worker_batch.extend_seq_lens[0]
-            if model_worker_batch.extend_seq_lens
-            else forward_batch.input_ids.numel()
-        )
-        prefix_len = len(req.prefix_indices)
-        stable_len = len(req.origin_input_ids) + len(req.output_ids)
-        stable_uncached_len = max(stable_len - prefix_len, 0)
-        draft_len = extend_len - stable_uncached_len
-        if draft_len <= 0:
-            draft_len = len(req.jacobi_draft_ids) or (self.block_size * self.num_blocks)
+        # Initialize per-request state
+        input_offset = 0
+        original_inputs = forward_batch.input_ids
 
-        stable_prefix = None
-        if stable_uncached_len > 0:
-            stable_prefix = forward_batch.input_ids[:stable_uncached_len].clone()
-
-        draft_ids = req.jacobi_draft_ids
-        if not draft_ids:
-            if self.prefill_random and self.vocab_size > 0:
-                draft_ids = torch.randint(
-                    0, self.vocab_size, (draft_len,), device=self.device
-                ).tolist()
+        for i, req in enumerate(model_worker_batch.reqs):
+            if model_worker_batch.extend_seq_lens:
+                extend_len = model_worker_batch.extend_seq_lens[i]
             else:
-                last_token = (
-                    req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
-                )
-                draft_ids = [last_token] * draft_len
-        elif len(draft_ids) != draft_len:
-            if len(draft_ids) > draft_len:
-                draft_ids = draft_ids[:draft_len]
-            else:
-                last_token = draft_ids[-1]
-                draft_ids = draft_ids + [last_token] * (draft_len - len(draft_ids))
+                extend_len = forward_batch.seq_lens[i].item()
 
-        draft_tensor = torch.tensor(draft_ids, dtype=torch.long, device=self.device)
-        accepted_ids = torch.empty((0,), dtype=torch.long, device=self.device)
-        new_draft = draft_tensor
-        bootstrap = req.jacobi_needs_bootstrap
+            prefix_len = len(req.prefix_indices)
+            stable_len = len(req.origin_input_ids) + len(req.output_ids)
+            stable_uncached_len = max(stable_len - prefix_len, 0)
+            draft_len = extend_len - stable_uncached_len
+            if draft_len <= 0:
+                draft_len = len(req.jacobi_draft_ids) or (self.block_size * self.num_blocks)
+
+            # Extract stable prefix for this request
+            stable_prefix = None
+            if stable_uncached_len > 0:
+                # Ensure we slice from the *original* input properly
+                # We assume forward_batch.input_ids has correct layout [req1, req2...]
+                stable_prefix = original_inputs[input_offset : input_offset + stable_uncached_len].clone()
+
+            input_offset += extend_len
+
+            # Initialize draft
+            draft_ids = req.jacobi_draft_ids
+            if not draft_ids:
+                if self.prefill_random and self.vocab_size > 0:
+                    draft_ids = torch.randint(
+                        0, self.vocab_size, (draft_len,), device=self.device
+                    ).tolist()
+                else:
+                    last_token = (
+                        req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+                    )
+                    draft_ids = [last_token] * draft_len
+            elif len(draft_ids) != draft_len:
+                if len(draft_ids) > draft_len:
+                    draft_ids = draft_ids[:draft_len]
+                else:
+                    last_token = draft_ids[-1]
+                    draft_ids = draft_ids + [last_token] * (draft_len - len(draft_ids))
+
+            draft_tensor = torch.tensor(draft_ids, dtype=torch.long, device=self.device)
+
+            req_states.append({
+                "req": req,
+                "draft_len": draft_len,
+                "stable_uncached_len": stable_uncached_len,
+                "stable_prefix": stable_prefix,
+                "new_draft": draft_tensor,
+                "accepted_ids": torch.empty((0,), dtype=torch.long, device=self.device),
+                "bootstrap": req.jacobi_needs_bootstrap
+            })
+
         can_run_cuda_graph = False
         logits_output = None
-
         steps = max(self.steps_per_yield, 1)
-        for _ in range(steps):
-            if stable_prefix is None:
-                input_ids = new_draft
-            else:
-                input_ids = torch.cat([stable_prefix, new_draft], dim=0)
 
-            if forward_batch.input_ids.numel() == input_ids.numel():
-                forward_batch.input_ids.copy_(input_ids)
+        for _ in range(steps):
+            # Construct batched inputs
+            batch_inputs = []
+            for state in req_states:
+                if state["stable_prefix"] is None:
+                    batch_inputs.append(state["new_draft"])
+                else:
+                    batch_inputs.append(torch.cat([state["stable_prefix"], state["new_draft"]], dim=0))
+
+            batched_input_tensor = torch.cat(batch_inputs, dim=0)
+
+            if forward_batch.input_ids.numel() == batched_input_tensor.numel():
+                forward_batch.input_ids.copy_(batched_input_tensor)
             else:
-                forward_batch.input_ids = input_ids
+                forward_batch.input_ids = batched_input_tensor
 
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=None
@@ -134,59 +426,80 @@ class JacobiWorker:
             if logits.dim() == 3:
                 logits = logits[0]
 
-            draft_logits = logits[-draft_len:] if draft_len > 0 else logits
-            if bootstrap:
-                new_draft = torch.argmax(draft_logits, dim=-1)
-                accepted_ids = torch.empty((0,), dtype=torch.long, device=self.device)
-                bootstrap = False
-                continue
+            # Process each request's logits
+            logit_offset = 0
+            for state in req_states:
+                req = state["req"]
+                draft_len = state["draft_len"]
+                total_len = state["stable_uncached_len"] + draft_len
 
-            current_draft = new_draft
-            had_rejection = False
-            if new_draft.numel() < 2:
-                accepted_ids = new_draft
-                next_token = torch.argmax(draft_logits[-1], dim=-1)
-                new_draft = next_token.view(1)
-            else:
-                greedy_tokens = torch.argmax(draft_logits[:-1], dim=-1)
-                mismatch = current_draft[1:] != greedy_tokens
-                accepted_len = int((mismatch.cumsum(0) == 0).sum().item()) + 1
-                accepted_ids = current_draft[:accepted_len]
-                had_rejection = accepted_len < current_draft.numel()
+                # Slice logits for this request
+                req_logits = logits[logit_offset : logit_offset + total_len]
+                logit_offset += total_len
 
-                next_token = torch.argmax(draft_logits[accepted_len - 1], dim=-1)
-                if accepted_len < current_draft.numel():
-                    tail_logits = draft_logits[accepted_len:-1]
-                    if tail_logits.numel() > 0:
-                        greedy_tail = torch.argmax(tail_logits, dim=-1)
-                        new_draft = torch.cat([next_token.view(1), greedy_tail], dim=0)
-                    else:
-                        new_draft = next_token.view(1)
+                draft_logits = req_logits[-draft_len:] if draft_len > 0 else req_logits
+
+                if state["bootstrap"]:
+                    state["new_draft"] = torch.argmax(draft_logits, dim=-1)
+                    state["accepted_ids"] = torch.empty((0,), dtype=torch.long, device=self.device)
+                    state["bootstrap"] = False
+                    continue
+
+                current_draft = state["new_draft"]
+                had_rejection = False
+
+                if current_draft.numel() < 2:
+                    state["accepted_ids"] = current_draft
+                    next_token = torch.argmax(draft_logits[-1], dim=-1)
+                    state["new_draft"] = next_token.view(1)
                 else:
-                    new_draft = next_token.view(1)
+                    greedy_tokens = torch.argmax(draft_logits[:-1], dim=-1)
+                    mismatch = current_draft[1:] != greedy_tokens
+                    accepted_len = int((mismatch.cumsum(0) == 0).sum().item()) + 1
+                    state["accepted_ids"] = current_draft[:accepted_len]
+                    had_rejection = accepted_len < current_draft.numel()
 
-            pool_tail = self._select_ngram_tail(req, draft_len - 1)
-            if had_rejection and pool_tail is not None:
-                new_draft = torch.tensor(
-                    [int(next_token.item())] + pool_tail,
-                    dtype=torch.long,
-                    device=self.device,
-                )
+                    next_token = torch.argmax(draft_logits[accepted_len - 1], dim=-1)
+                    if accepted_len < current_draft.numel():
+                        tail_logits = draft_logits[accepted_len:-1]
+                        if tail_logits.numel() > 0:
+                            greedy_tail = torch.argmax(tail_logits, dim=-1)
+                            state["new_draft"] = torch.cat([next_token.view(1), greedy_tail], dim=0)
+                        else:
+                            state["new_draft"] = next_token.view(1)
+                    else:
+                        state["new_draft"] = next_token.view(1)
 
-            if new_draft.numel() < draft_len:
-                pad_len = draft_len - new_draft.numel()
-                pad_token = new_draft[-1]
-                pad_tokens = pad_token.repeat(pad_len)
-                new_draft = torch.cat([new_draft, pad_tokens], dim=0)
-            elif new_draft.numel() > draft_len:
-                new_draft = new_draft[:draft_len]
+                pool_tail = self._select_ngram_tail(req, draft_len - 1)
+                if had_rejection and pool_tail is not None:
+                    state["new_draft"] = torch.tensor(
+                        [int(next_token.item())] + pool_tail,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
 
-            if self.ngram_pool_size > 0:
-                self._append_ngram_pool(req, new_draft.tolist())
+                if state["new_draft"].numel() < draft_len:
+                    pad_len = draft_len - state["new_draft"].numel()
+                    pad_token = state["new_draft"][-1]
+                    pad_tokens = pad_token.repeat(pad_len)
+                    state["new_draft"] = torch.cat([state["new_draft"], pad_tokens], dim=0)
+                elif state["new_draft"].numel() > draft_len:
+                    state["new_draft"] = state["new_draft"][:draft_len]
+
+                if self.ngram_pool_size > 0:
+                    self._append_ngram_pool(req, state["new_draft"].tolist())
+
+        # Aggregate results
+        all_next_token_ids = []
+        all_draft_ids = []
+
+        for state in req_states:
+            all_next_token_ids.append(state["accepted_ids"])
+            all_draft_ids.append(state["new_draft"])
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=accepted_ids,
-            draft_ids=new_draft,
+            next_token_ids=torch.cat(all_next_token_ids, dim=0),
+            draft_ids=torch.cat(all_draft_ids, dim=0),
             can_run_cuda_graph=can_run_cuda_graph,
         )

@@ -432,6 +432,18 @@ class ServerArgs:
     jacobi_num_blocks: int = 1
     jacobi_ngram_pool_size: int = 0
     jacobi_prefill_random: bool = False
+    jacobi_max_batch_size: Optional[int] = None
+    jacobi_accept_rate_low: Optional[float] = None
+    jacobi_accept_rate_high: Optional[float] = None
+    jacobi_accept_rate_ema_decay: float = 0.9
+    jacobi_accept_rate_warmup: int = 0
+    jacobi_accept_rate_probe_interval: int = 0
+    jacobi_max_batch_size: Optional[int] = None
+    jacobi_accept_rate_low: Optional[float] = None
+    jacobi_accept_rate_high: Optional[float] = None
+    jacobi_accept_rate_ema_decay: float = 0.9
+    jacobi_accept_rate_warmup: int = 0
+    jacobi_accept_rate_probe_interval: int = 0
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2613,6 +2625,101 @@ class ServerArgs:
         )
 
         # HTTP server
+        parser.add_argument(
+            "--jacobi-steps-per-yield",
+            type=int,
+            default=ServerArgs.jacobi_steps_per_yield,
+            help="The number of steps for jacobi decoding per yield.",
+        )
+        parser.add_argument(
+            "--jacobi-num-blocks",
+            type=int,
+            default=ServerArgs.jacobi_num_blocks,
+            help="The number of blocks for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-ngram-pool-size",
+            type=int,
+            default=ServerArgs.jacobi_ngram_pool_size,
+            help="The size of the ngram pool for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-prefill-random",
+            action="store_true",
+            help="Whether to use random prefill for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-max-batch-size",
+            type=int,
+            default=ServerArgs.jacobi_max_batch_size,
+            help="The maximum batch size for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-low",
+            type=float,
+            default=ServerArgs.jacobi_accept_rate_low,
+            help="The low acceptance rate threshold for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-high",
+            type=float,
+            default=ServerArgs.jacobi_accept_rate_high,
+            help="The high acceptance rate threshold for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-ema-decay",
+            type=float,
+            default=ServerArgs.jacobi_accept_rate_ema_decay,
+            help="The ema decay for jacobi decoding acceptance rate.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-warmup",
+            type=int,
+            default=ServerArgs.jacobi_accept_rate_warmup,
+            help="The warmup steps for jacobi decoding acceptance rate.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-probe-interval",
+            type=int,
+            default=ServerArgs.jacobi_accept_rate_probe_interval,
+            help="The probe interval for jacobi decoding when disabled.",
+        )
+        parser.add_argument(
+            "--jacobi-max-batch-size",
+            type=int,
+            default=ServerArgs.jacobi_max_batch_size,
+            help="The maximum batch size for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-low",
+            type=float,
+            default=ServerArgs.jacobi_accept_rate_low,
+            help="The low acceptance rate threshold for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-high",
+            type=float,
+            default=ServerArgs.jacobi_accept_rate_high,
+            help="The high acceptance rate threshold for jacobi decoding.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-ema-decay",
+            type=float,
+            default=ServerArgs.jacobi_accept_rate_ema_decay,
+            help="The ema decay for jacobi decoding acceptance rate.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-warmup",
+            type=int,
+            default=ServerArgs.jacobi_accept_rate_warmup,
+            help="The warmup steps for jacobi decoding acceptance rate.",
+        )
+        parser.add_argument(
+            "--jacobi-accept-rate-probe-interval",
+            type=int,
+            default=ServerArgs.jacobi_accept_rate_probe_interval,
+            help="The probe interval for jacobi decoding when disabled.",
+        )
         parser.add_argument(
             "--host",
             type=str,
