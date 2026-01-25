@@ -433,12 +433,8 @@ class ServerArgs:
     jacobi_ngram_pool_size: int = 0
     jacobi_prefill_random: bool = False
     jacobi_max_batch_size: Optional[int] = None
-    jacobi_accept_rate_low: Optional[float] = None
-    jacobi_accept_rate_high: Optional[float] = None
-    jacobi_accept_rate_ema_decay: float = 0.9
-    jacobi_accept_rate_warmup: int = 0
-    jacobi_accept_rate_probe_interval: int = 0
-    jacobi_max_batch_size: Optional[int] = None
+    jacobi_waiting_running_ratio_high: float = 2.5
+    jacobi_waiting_running_ratio_low: float = 1.8
     jacobi_accept_rate_low: Optional[float] = None
     jacobi_accept_rate_high: Optional[float] = None
     jacobi_accept_rate_ema_decay: float = 0.9

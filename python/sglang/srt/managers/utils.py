@@ -64,11 +64,14 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
-        if self.draft_ids is not None:
+        if isinstance(self.next_token_ids, torch.Tensor):
+            self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        if self.draft_ids is not None and isinstance(self.draft_ids, torch.Tensor):
             self.draft_ids = self.draft_ids.to("cpu", non_blocking=True)
 
-        if self.accept_lens is not None:
+        if self.accept_lens is not None and isinstance(
+            self.accept_lens, torch.Tensor
+        ):
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()

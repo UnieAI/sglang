@@ -323,66 +323,117 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        next_token_ids = result.next_token_ids.tolist()
-        draft_ids = result.draft_ids.tolist() if result.draft_ids is not None else []
+        # Handle next_token_ids which might be a Tensor or List[List[int]]
+        if isinstance(result.next_token_ids, torch.Tensor):
+            next_token_ids_flat = result.next_token_ids.tolist()
+            if result.accept_length_per_req_cpu is not None:
+                next_token_ids_list = []
+                offset = 0
+                for length in result.accept_length_per_req_cpu:
+                    next_token_ids_list.append(
+                        next_token_ids_flat[offset : offset + length]
+                    )
+                    offset += length
+            else:
+                next_token_ids_list = [
+                    [t] for t in next_token_ids_flat
+                ]
+        elif result.next_token_ids is None:
+            next_token_ids_list = [[] for _ in range(len(batch.reqs))]
+        else:
+            next_token_ids_list = result.next_token_ids
+            if next_token_ids_list and not isinstance(next_token_ids_list[0], list):
+                next_token_ids_list = [[t] for t in next_token_ids_list]
+        if len(next_token_ids_list) < len(batch.reqs):
+            next_token_ids_list.extend(
+                [[] for _ in range(len(batch.reqs) - len(next_token_ids_list))]
+            )
+
+        # Handle draft_ids
+        if result.draft_ids is None:
+            draft_ids_list = [[] for _ in range(len(batch.reqs))]
+        elif isinstance(result.draft_ids, torch.Tensor):
+            draft_ids_list = result.draft_ids.tolist()
+            if draft_ids_list and not isinstance(draft_ids_list[0], list):
+                if len(batch.reqs) == 1:
+                    draft_ids_list = [draft_ids_list]
+                else:
+                    draft_ids_list = [[] for _ in range(len(batch.reqs))]
+        else:
+            draft_ids_list = result.draft_ids
+        if len(draft_ids_list) < len(batch.reqs):
+            draft_ids_list.extend(
+                [[] for _ in range(len(batch.reqs) - len(draft_ids_list))]
+            )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        assert len(batch.reqs) == 1, "Jacobi MVP expects batch size = 1"
-        req = batch.reqs[0]
+        current_out_cache_offset = 0
 
-        # Append accepted tokens and check EOS per token.
-        accepted_ids = []
-        for token_id in next_token_ids:
-            req.output_ids.append(token_id)
-            accepted_ids.append(token_id)
-            req.check_finished()
-            if req.finished():
-                break
+        for i, req in enumerate(batch.reqs):
+            next_tokens = next_token_ids_list[i]
+            drafts = draft_ids_list[i]
 
-        accepted_len = len(accepted_ids)
-        self.num_generated_tokens += accepted_len
+            # Append accepted tokens
+            accepted_len = 0
+            for token_id in next_tokens:
+                req.output_ids.append(token_id)
+                accepted_len += 1
+                req.check_finished()
+                if req.finished():
+                    break
 
-        req.jacobi_draft_ids = draft_ids
-        req.jacobi_needs_bootstrap = False
-        # Only cache committed tokens; drafts are speculative and should not occupy KV cache.
-        req.fill_ids = req.origin_input_ids + req.output_ids
+            self.num_generated_tokens += accepted_len
 
-        page_size = get_global_server_args().page_size
-        prefix_len = batch.prefix_lens[0]
-        extend_len = batch.extend_lens[0]
-        stable_len = len(req.origin_input_ids) + len(req.output_ids)
-        new_committed = stable_len
-        new_allocated = (
-            ceil_align(new_committed, page_size) if page_size > 1 else new_committed
-        )
-        keep_len = max(0, min(new_allocated - prefix_len, extend_len))
+            # Update draft
+            req.jacobi_draft_ids = drafts
+            req.jacobi_needs_bootstrap = False
 
-        out_cache_loc = batch.out_cache_loc
-        if keep_len < extend_len:
-            to_free = out_cache_loc[keep_len:]
-            self.token_to_kv_pool_allocator.free(to_free)
+            # Memory update logic
+            page_size = get_global_server_args().page_size
+            prefix_len = int(batch.prefix_lens[i])
+            extend_len = int(batch.extend_lens[i])
 
-        req.kv_committed_len = new_committed
-        req.kv_allocated_len = max(new_allocated, new_committed)
+            # Slice out_cache_loc for this request
+            req_out_cache_loc = batch.out_cache_loc[
+                current_out_cache_offset : current_out_cache_offset + extend_len
+            ]
+            current_out_cache_offset += extend_len
 
-        committed_extend_len = max(0, new_committed - prefix_len)
-        if committed_extend_len > 0:
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices[:1],
-                batch.req_to_token_pool.req_to_token,
-                torch.tensor([prefix_len], device=out_cache_loc.device),
-                torch.tensor([new_committed], device=out_cache_loc.device),
-                out_cache_loc[:committed_extend_len],
-                1,
+            stable_len = len(req.origin_input_ids) + len(req.output_ids)
+            new_committed = stable_len
+            new_allocated = (
+                ceil_align(new_committed, page_size) if page_size > 1 else new_committed
             )
+            # Re-calculate how much of the "extended" allocation we actually keep
+            # extend_len was the "max" possible expansion (draft budget).
+            # new_allocated - prefix_len is what we actually used/need.
+            keep_len = max(0, min(new_allocated - prefix_len, extend_len))
 
-        if req.finished():
-            req.jacobi_draft_ids = []
-            release_kv_cache(req, self.tree_cache)
-            req.time_stats.completion_time = time.perf_counter()
-        else:
-            self.tree_cache.cache_unfinished_req(req)
+            if keep_len < extend_len:
+                to_free = req_out_cache_loc[keep_len:]
+                self.token_to_kv_pool_allocator.free(to_free)
+
+            req.kv_committed_len = new_committed
+            req.kv_allocated_len = max(new_allocated, new_committed)
+
+            committed_extend_len = max(0, new_committed - prefix_len)
+            if committed_extend_len > 0:
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices[i:i+1],
+                    batch.req_to_token_pool.req_to_token,
+                    torch.tensor([prefix_len], device=req_out_cache_loc.device),
+                    torch.tensor([new_committed], device=req_out_cache_loc.device),
+                    req_out_cache_loc[:committed_extend_len],
+                    1,
+                )
+
+            if req.finished():
+                req.jacobi_draft_ids = []
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.completion_time = time.perf_counter()
+            else:
+                self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

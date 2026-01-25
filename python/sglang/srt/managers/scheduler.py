@@ -307,6 +307,7 @@ class Scheduler(
         self.ngram_accept_rate_gate_open = True
         self.ngram_accept_rate_probe_steps = 0
         self.ngram_waiting_running_gate_open = True
+        self.jacobi_waiting_running_gate_open = True
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
@@ -1770,7 +1771,24 @@ class Scheduler(
             # Run decode
             if not self.running_batch.is_empty():
                 if self.running_batch.is_jacobi:
-                    ret = self.update_running_batch_jacobi(self.running_batch)
+                    if self._jacobi_waiting_running_ratio_allows():
+                        # Use standard update_running_batch which supports batching
+                        # Pre-init relies on update_running_batch handling is_jacobi check (it does)
+                        self.running_batch = self.update_running_batch(self.running_batch)
+                        ret = (
+                            self.running_batch
+                            if not self.running_batch.is_empty()
+                            else None
+                        )
+                    else:
+                        # Fallback to standard decode
+                        self.running_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                        self.running_batch = self.update_running_batch(self.running_batch)
+                        ret = (
+                            self.running_batch
+                            if not self.running_batch.is_empty()
+                            else None
+                        )
                 else:
                     self.running_batch = self.update_running_batch(self.running_batch)
                     ret = (
@@ -2250,6 +2268,32 @@ class Scheduler(
                 self.ngram_waiting_running_gate_open = True
 
         return self.ngram_waiting_running_gate_open
+
+    def _jacobi_waiting_running_ratio_allows(self) -> bool:
+        high = self.server_args.jacobi_waiting_running_ratio_high
+        low = self.server_args.jacobi_waiting_running_ratio_low
+        # Assuming current logic doesn't have max_concurrency for Jacobi yet, can add if needed or ignore
+        if high is None and low is None:
+            return True
+
+        running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        if running <= 0:
+            return True
+
+        # Use running as denominator similar to NGRAM logic
+        ratio = (len(self.waiting_queue) + running) / running
+
+        if self.jacobi_waiting_running_gate_open:
+            if high is not None and ratio > high:
+                logger.info(f"Disable Jacobi due to high waiting/running ratio: {ratio:.2f} > {high}")
+                self.jacobi_waiting_running_gate_open = False
+        else:
+            threshold = low if low is not None else high
+            if threshold is not None and ratio < threshold:
+                logger.info(f"Enable Jacobi due to low waiting/running ratio: {ratio:.2f} < {threshold}")
+                self.jacobi_waiting_running_gate_open = True
+
+        return self.jacobi_waiting_running_gate_open
 
     def _should_use_ngram_for_decode(self, batch: ScheduleBatch) -> bool:
         if not batch.forward_mode.is_decode():
