@@ -1718,6 +1718,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_lookahead()
         ):
             return not self.is_draft_worker
 
@@ -1746,6 +1747,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_lookahead()
         ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -1886,6 +1888,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     retrive_next_token=None,
                     retrive_next_sibling=None,
                     draft_token_num=num_tokens_per_bs,
+                )
+                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+            elif self.spec_algorithm.is_lookahead():
+                from sglang.srt.speculative.lookahead_info import LookaheadVerifyInput
+
+                spec_info = LookaheadVerifyInput(
+                    draft_token=None,
+                    custom_mask=buffers.custom_mask,
+                    positions=None,
+                    draft_token_num=num_tokens_per_bs,
+                    lookahead_len=self.server_args.lookahead_window,
                 )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 

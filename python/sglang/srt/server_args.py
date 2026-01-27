@@ -467,6 +467,18 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
+    # Speculative decoding (lookahead)
+    lookahead_window: int = 8
+    lookahead_ngram: int = 2
+    lookahead_pool_size: int = 1024
+    lookahead_guess_set_size: int = 3
+    lookahead_pool_from_prompt: bool = False
+    lookahead_random_prefill: bool = False
+    lookahead_disable_pool_update: bool = False
+    lookahead_keep_prefix_last_token: bool = False
+    lookahead_prefix_only_mask: bool = False
+    lookahead_debug: bool = False
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
@@ -1020,7 +1032,7 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
+                elif self.speculative_algorithm not in ("NGRAM", "LOOKAHEAD"):
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
@@ -2242,6 +2254,46 @@ class ServerArgs:
                 # TODO: support dp attention for ngram speculative decoding
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
+                )
+
+        if self.speculative_algorithm == "LOOKAHEAD":
+            if not self.device.startswith("cuda"):
+                raise ValueError(
+                    "Lookahead speculative decoding only supports CUDA device."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+
+            if self.lookahead_ngram != 2:
+                raise ValueError("Lookahead only supports ngram size 2 for now.")
+            if self.lookahead_window <= 0:
+                raise ValueError("lookahead_window must be >= 1.")
+            if self.lookahead_pool_size <= 0:
+                raise ValueError("lookahead_pool_size must be >= 1.")
+            if self.lookahead_guess_set_size <= 0:
+                raise ValueError("lookahead_guess_set_size must be >= 1.")
+
+            desired_draft_tokens = 1 + self.lookahead_window
+            if (
+                self.speculative_num_draft_tokens is None
+                or self.speculative_num_draft_tokens != desired_draft_tokens
+            ):
+                self.speculative_num_draft_tokens = desired_draft_tokens
+
+            # Lookahead uses target verify only; keep topk at 1 for safety.
+            self.speculative_eagle_topk = 1
+
+            if self.enable_dp_attention:
+                # TODO: support dp attention for lookahead speculative decoding
+                raise ValueError(
+                    "Currently lookahead speculative decoding does not support dp attention."
                 )
 
     def _handle_load_format(self):
@@ -3582,7 +3634,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "LOOKAHEAD"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3722,6 +3774,68 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+
+        # Speculative decoding (lookahead)
+        parser.add_argument(
+            "--lookahead-window",
+            type=int,
+            default=ServerArgs.lookahead_window,
+            help="The draft window size for lookahead speculative decoding.",
+        )
+        parser.add_argument(
+            "--lookahead-ngram",
+            type=int,
+            default=ServerArgs.lookahead_ngram,
+            help="The n-gram size for lookahead speculative decoding (currently only 2 is supported).",
+        )
+        parser.add_argument(
+            "--lookahead-pool-size",
+            type=int,
+            default=ServerArgs.lookahead_pool_size,
+            help="The maximum number of keys to keep in the lookahead 2-gram pool.",
+        )
+        parser.add_argument(
+            "--lookahead-guess-set-size",
+            type=int,
+            default=ServerArgs.lookahead_guess_set_size,
+            help="The maximum number of guesses stored per key in the lookahead 2-gram pool (LRU).",
+        )
+        parser.add_argument(
+            "--lookahead-pool-from-prompt",
+            action="store_true",
+            default=ServerArgs.lookahead_pool_from_prompt,
+            help="Seed the lookahead 2-gram pool from the prompt.",
+        )
+        parser.add_argument(
+            "--lookahead-random-prefill",
+            action="store_true",
+            default=ServerArgs.lookahead_random_prefill,
+            help="Use random tokens to prefill the lookahead window (debug only).",
+        )
+        parser.add_argument(
+            "--lookahead-disable-pool-update",
+            action="store_true",
+            default=ServerArgs.lookahead_disable_pool_update,
+            help="Disable updating the lookahead 2-gram pool from forward predictions.",
+        )
+        parser.add_argument(
+            "--lookahead-keep-prefix-last-token",
+            action="store_true",
+            default=ServerArgs.lookahead_keep_prefix_last_token,
+            help="Allow lookahead draft tokens to attend to the prefix last token.",
+        )
+        parser.add_argument(
+            "--lookahead-prefix-only-mask",
+            action="store_true",
+            default=ServerArgs.lookahead_prefix_only_mask,
+            help="Only allow lookahead draft tokens to attend to the prefix.",
+        )
+        parser.add_argument(
+            "--lookahead-debug",
+            action="store_true",
+            default=ServerArgs.lookahead_debug,
+            help="Enable lookahead debug logging.",
         )
 
         # Multi-layer Eagle speculative decoding

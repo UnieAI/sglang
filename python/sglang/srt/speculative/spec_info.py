@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.lookahead_worker import LookaheadWorker
 
 
 class SpeculativeAlgorithm(Enum):
@@ -19,6 +20,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    LOOKAHEAD = auto()
     NONE = auto()
 
     @classmethod
@@ -46,12 +48,22 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_lookahead(self) -> bool:
+        return self == SpeculativeAlgorithm.LOOKAHEAD
+
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+    ) -> Optional[
+        Union[
+            Type[BaseSpecWorker],
+            Type[TpModelWorker],
+            Type[NGRAMWorker],
+            Type[LookaheadWorker],
+        ]
+    ]:
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -101,6 +113,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_lookahead():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.lookahead_worker import LookaheadWorker
+
+            return LookaheadWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 
@@ -111,6 +132,7 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    LOOKAHEAD_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -126,6 +148,7 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.LOOKAHEAD_VERIFY,
         }
 
     @abstractmethod

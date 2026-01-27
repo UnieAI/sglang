@@ -276,6 +276,7 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_lookahead()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -434,6 +435,7 @@ class CudaGraphRunner:
                 == forward_batch.input_ids.numel()
             )
             if self.model_runner.spec_algorithm.is_ngram()
+            or self.model_runner.spec_algorithm.is_lookahead()
             else True
         )
 
@@ -922,6 +924,17 @@ class CudaGraphRunner:
                 retrive_next_token=None,
                 retrive_next_sibling=None,
                 draft_token_num=self.num_tokens_per_bs,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+        elif self.model_runner.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_info import LookaheadVerifyInput
+
+            spec_info = LookaheadVerifyInput(
+                draft_token=None,
+                custom_mask=self.buffers.custom_mask,
+                positions=None,
+                draft_token_num=self.num_tokens_per_bs,
+                lookahead_len=self.model_runner.server_args.lookahead_window,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
