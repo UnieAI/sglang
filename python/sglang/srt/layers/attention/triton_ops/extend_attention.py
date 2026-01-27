@@ -250,6 +250,7 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    DROP_PREFIX_LAST_TOKEN: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
@@ -334,6 +335,9 @@ def _fwd_kernel(
                 other=0,
             )
             final_mask &= custom_mask
+        if DROP_PREFIX_LAST_TOKEN:
+            drop_mask = (start_n + offs_n[None, :]) != (cur_seq_len_prefix - 1)
+            final_mask &= drop_mask
         if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
             # q_id = prefix_len + cur_m, kv_id = cur_n
@@ -556,6 +560,7 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    drop_prefix_last_token=False,
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
@@ -635,6 +640,7 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        DROP_PREFIX_LAST_TOKEN=drop_prefix_last_token,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,

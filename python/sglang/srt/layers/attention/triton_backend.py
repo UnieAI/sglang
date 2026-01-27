@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -45,6 +46,7 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     custom_mask: torch.Tensor
     mask_indptr: torch.Tensor
+    drop_prefix_last_token: bool
     # Sliding window
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
@@ -235,7 +237,9 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
         window_kv_offsets = None
+        drop_prefix_last_token = False
         spec_info = forward_batch.spec_info
+        drop_prefix_last_token = False
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -339,12 +343,24 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
+            mask_indptr = None
+            if (
+                spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.LOOKAHEAD_VERIFY
+                and not self.enable_deterministic
+                and not getattr(spec_info, "prefix_only_mask", False)
+            ):
+                drop_prefix_last_token = not getattr(
+                    spec_info, "keep_prefix_last_token", True
+                )
+                custom_mask = None
+            else:
+                seq_mask_len = self.num_draft_tokens * (
+                    forward_batch.seq_lens + self.num_draft_tokens
+                )
+                mask_indptr = self.mask_indptr
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
@@ -422,6 +438,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
+            drop_prefix_last_token,
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
@@ -466,8 +483,14 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices = kv_indices_buf
 
         if not self.skip_prefill:
+            custom_mask_len = max_num_tokens * self.max_context_len
+            if self.num_draft_tokens > 1:
+                # Speculative custom masks include draft-draft attention.
+                custom_mask_len = max_num_tokens * (
+                    self.max_context_len + self.num_draft_tokens
+                )
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (custom_mask_len,),
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -592,12 +615,29 @@ class TritonAttnBackend(AttentionBackend):
                         self.token_to_kv_pool_allocator,
                     )
                 )
+            use_custom_mask = True
+            if (
+                spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.LOOKAHEAD_VERIFY
+                and not self.enable_deterministic
+                and not getattr(spec_info, "prefix_only_mask", False)
+            ):
+                drop_prefix_last_token = not getattr(
+                    spec_info, "keep_prefix_last_token", True
+                )
+                use_custom_mask = False
 
-            custom_mask = self.cuda_graph_custom_mask
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
-            mask_indptr = self.mask_indptr[: bs + 1]
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            if use_custom_mask:
+                custom_mask = self.cuda_graph_custom_mask
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                seq_mask_len = self.num_draft_tokens * (
+                    seq_lens + self.num_draft_tokens
+                )
+                mask_indptr = self.mask_indptr[: bs + 1]
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            else:
+                custom_mask = None
+                mask_indptr = None
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
@@ -645,6 +685,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
+            drop_prefix_last_token,
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
@@ -663,6 +704,8 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         # NOTE: encoder_lens expected to be zeros or None
+        if self.forward_metadata is not None:
+            self.forward_metadata.drop_prefix_last_token = False
         if forward_mode.is_decode_or_idle():
             # Update kv_indptr, kv_indices
             kv_indptr = self.kv_indptr
@@ -744,11 +787,34 @@ class TritonAttnBackend(AttentionBackend):
                         self.token_to_kv_pool_allocator,
                     )
                 )
-            custom_mask = self.cuda_graph_custom_mask
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
-            mask_indptr = self.mask_indptr[: bs + 1]
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            drop_prefix_last_token = False
+            use_custom_mask = True
+            if (
+                spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.LOOKAHEAD_VERIFY
+                and not self.enable_deterministic
+                and not getattr(spec_info, "prefix_only_mask", False)
+            ):
+                drop_prefix_last_token = not getattr(
+                    spec_info, "keep_prefix_last_token", True
+                )
+                use_custom_mask = False
+
+            if use_custom_mask:
+                custom_mask = self.cuda_graph_custom_mask
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                seq_mask_len = self.num_draft_tokens * (
+                    seq_lens + self.num_draft_tokens
+                )
+                mask_indptr = self.mask_indptr[: bs + 1]
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            else:
+                custom_mask = None
+                mask_indptr = None
+            if self.forward_metadata is not None:
+                self.forward_metadata.custom_mask = custom_mask
+                self.forward_metadata.mask_indptr = mask_indptr
+                self.forward_metadata.drop_prefix_last_token = drop_prefix_last_token
         elif forward_mode.is_draft_extend(include_v2=True):
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
@@ -851,6 +917,7 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.max_extend_len,
             layer.scaling,
             logit_cap=logits_soft_cap,
+            drop_prefix_last_token=self.forward_metadata.drop_prefix_last_token,
             sliding_window_size=sliding_window_size,
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
