@@ -1944,9 +1944,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     @property
     def is_spec_v2(self):
         # FIXME: finally deprecate is_spec_v2
-        ret = self.enable_overlap and not self.spec_algorithm.is_none()
-        assert not ret or self.spec_algorithm.supports_spec_v2()
-        return ret
+        return self.enable_overlap and self.spec_algorithm.supports_spec_v2()
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE

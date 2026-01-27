@@ -1165,9 +1165,9 @@ class Scheduler(
         # TODO(lsyin): support overlap + spec + grammar
         need_grammar_sync = (
             batch
-            and batch.is_spec_v2
             and batch.has_grammar
             and batch.forward_mode.is_decode()
+            and not batch.spec_algorithm.is_none()
             and len(self.result_queue) > 0
         )
 

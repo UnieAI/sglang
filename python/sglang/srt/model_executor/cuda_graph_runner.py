@@ -21,6 +21,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -91,6 +92,12 @@ if TYPE_CHECKING:
 
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
+
+
+@dataclass
+class DecodeGraphOutput:
+    logits_output: LogitsProcessorOutput
+    next_token_ids: torch.Tensor
 
 
 def get_is_capture_mode():
@@ -289,6 +296,11 @@ class CudaGraphRunner:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
+        self.capture_decode_sample = (
+            model_runner.server_args.enable_decode_step_cuda_graph
+            and self.capture_forward_mode == ForwardMode.DECODE
+        )
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
@@ -307,6 +319,12 @@ class CudaGraphRunner:
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
+        self._bucket_for_bs = None
+        if not self.require_mlp_tp_gather:
+            self._bucket_for_bs = [0] * (self.max_bs + 1)
+            for bs in range(1, self.max_bs + 1):
+                index = bisect.bisect_left(self.capture_bs, bs)
+                self._bucket_for_bs[bs] = self.capture_bs[index]
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -720,6 +738,18 @@ class CudaGraphRunner:
                 forward_batch,
                 **kwargs,
             )
+            if (
+                self.capture_decode_sample
+                and isinstance(logits_output_or_pp_proxy_tensors, LogitsProcessorOutput)
+                and logits_output_or_pp_proxy_tensors.next_token_logits is not None
+            ):
+                next_token_ids = torch.argmax(
+                    logits_output_or_pp_proxy_tensors.next_token_logits, dim=-1
+                )
+                return DecodeGraphOutput(
+                    logits_output=logits_output_or_pp_proxy_tensors,
+                    next_token_ids=next_token_ids,
+                )
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -793,8 +823,14 @@ class CudaGraphRunner:
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
-        bs = self.capture_bs[index]
+            if self._bucket_for_bs is not None:
+                bs = self._bucket_for_bs[raw_bs]
+                index = None
+            else:
+                index = bisect.bisect_left(self.capture_bs, raw_bs)
+                bs = self.capture_bs[index]
+        if self.require_mlp_tp_gather:
+            bs = self.capture_bs[index]
 
         seq_lens_cpu = buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
@@ -863,6 +899,8 @@ class CudaGraphRunner:
             graph_key = self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
+        if isinstance(output, DecodeGraphOutput):
+            output = output.logits_output
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
@@ -885,6 +923,49 @@ class CudaGraphRunner:
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+
+    def replay_with_sampling(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> tuple[LogitsProcessorOutput, torch.Tensor]:
+        self.deepep_adapter.replay()
+
+        if not skip_attn_backend_init:
+            self.replay_prepare(forward_batch, pp_proxy_tensors)
+        else:
+            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{self.bs}"
+        else:
+            graph_key = self.bs
+        self.graphs[graph_key].replay()
+        output = self.output_buffers[graph_key]
+        if not isinstance(output, DecodeGraphOutput):
+            raise RuntimeError("Decode-step cuda graph output is not available.")
+
+        logits_output = output.logits_output
+        if self.is_dllm:
+            next_token_logits = None
+            full_logits = logits_output.full_logits[: self.raw_num_token]
+        else:
+            full_logits = None
+            next_token_logits = logits_output.next_token_logits[: self.raw_num_token]
+
+        trimmed = LogitsProcessorOutput(
+            next_token_logits=next_token_logits,
+            full_logits=full_logits,
+            hidden_states=(
+                logits_output.hidden_states[: self.raw_num_token]
+                if logits_output.hidden_states is not None
+                else None
+            ),
+            customized_info=logits_output.customized_info,
+        )
+        return trimmed, output.next_token_ids[: self.raw_bs]
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

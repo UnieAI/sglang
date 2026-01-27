@@ -476,9 +476,12 @@ class ServerArgs:
     lookahead_random_prefill: bool = False
     lookahead_disable_pool_update: bool = False
     lookahead_keep_prefix_last_token: bool = False
+    lookahead_apply_prefix_drop: bool = False
     lookahead_prefix_only_mask: bool = False
+    lookahead_disable_custom_mask: bool = False
     lookahead_debug: bool = False
     lookahead_jacobi_max_iter: int = 1
+    lookahead_enable_overlap: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -570,6 +573,7 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_decode_step_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
@@ -2228,7 +2232,8 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
+            if not self.lookahead_enable_overlap:
+                self.disable_overlap_schedule = True
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
@@ -3829,10 +3834,25 @@ class ServerArgs:
             help="Allow lookahead draft tokens to attend to the prefix last token.",
         )
         parser.add_argument(
+            "--lookahead-apply-prefix-drop",
+            action="store_true",
+            default=ServerArgs.lookahead_apply_prefix_drop,
+            help=(
+                "Apply prefix last-token masking in lookahead verify when "
+                "--lookahead-keep-prefix-last-token is not set."
+            ),
+        )
+        parser.add_argument(
             "--lookahead-prefix-only-mask",
             action="store_true",
             default=ServerArgs.lookahead_prefix_only_mask,
             help="Only allow lookahead draft tokens to attend to the prefix.",
+        )
+        parser.add_argument(
+            "--lookahead-disable-custom-mask",
+            action="store_true",
+            default=ServerArgs.lookahead_disable_custom_mask,
+            help="Disable building custom attention masks for lookahead verify.",
         )
         parser.add_argument(
             "--lookahead-debug",
@@ -3845,6 +3865,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.lookahead_jacobi_max_iter,
             help="Max iterations for Jacobi decoding in lookahead forward.",
+        )
+        parser.add_argument(
+            "--lookahead-enable-overlap",
+            action="store_true",
+            default=ServerArgs.lookahead_enable_overlap,
+            help="Enable overlap scheduling for lookahead speculative decoding (experimental).",
         )
 
         # Multi-layer Eagle speculative decoding
@@ -4272,6 +4298,14 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-decode-step-cuda-graph",
+            action="store_true",
+            help=(
+                "Enable a decode-step CUDA graph (forward + greedy argmax) when "
+                "sampling is pure greedy and no logit processors/penalties/grammars are used."
+            ),
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

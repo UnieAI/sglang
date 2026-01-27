@@ -28,11 +28,15 @@ class LookaheadVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor,
-        custom_mask: torch.Tensor,
+        custom_mask: Optional[torch.Tensor],
         positions: torch.Tensor,
         draft_token_num: int,
         lookahead_len: int,
         debug: bool = False,
+        keep_prefix_last_token: bool = False,
+        apply_prefix_drop: bool = False,
+        prefix_only_mask: bool = False,
+        use_custom_mask: bool = True,
     ):
         super().__init__(SpecInputType.LOOKAHEAD_VERIFY)
         self.draft_token = draft_token
@@ -46,6 +50,15 @@ class LookaheadVerifyInput(SpecInput):
             self.device = self.custom_mask.device
         self.root_len = 1
         self.debug = debug
+        self.keep_prefix_last_token = keep_prefix_last_token
+        self.apply_prefix_drop = apply_prefix_drop
+        self.prefix_only_mask = prefix_only_mask
+        self.use_custom_mask = use_custom_mask
+        self.drop_prefix_last_token = (
+            apply_prefix_drop
+            and (not keep_prefix_last_token)
+            and (not prefix_only_mask)
+        )
         # For ForwardBatch sizing in target_verify.
         self.num_tokens_per_batch = draft_token_num
         self.num_tokens_for_logprob_per_batch = draft_token_num
@@ -56,7 +69,9 @@ class LookaheadVerifyInput(SpecInput):
         self.verified_id: Optional[torch.Tensor] = None
         self.predicted_pairs: Optional[List[List[Tuple[int, int]]]] = None
         self.accept_last_token: Optional[torch.Tensor] = None
+        self.accept_last_token_cpu: Optional[torch.Tensor] = None
         self.mismatch_token: Optional[torch.Tensor] = None
+        self.mismatch_token_cpu: Optional[torch.Tensor] = None
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -108,6 +123,8 @@ class LookaheadVerifyInput(SpecInput):
         if self.debug:
             draft_num = self.draft_token_num
             req_to_token = batch.req_to_token_pool.req_to_token
+            accept_counts_cpu = (self.accept_length.cpu() + 1).clamp(min=0)
+            offsets_cpu = torch.cumsum(accept_counts_cpu, dim=0) - accept_counts_cpu
             for i, req in enumerate(batch.reqs):
                 seq_len = int(batch.seq_lens[i].item())
                 pool_idx = int(batch.req_pool_indices[i].item())
@@ -175,51 +192,45 @@ class LookaheadVerifyInput(SpecInput):
         return kv_indices, cum_kv_seq_len, self.qo_indptr, self.custom_mask
 
     def _fill_requests(
-        self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
-    ):
-        accept_index_cpu = self.accepted_indices.tolist()
-        predict_cpu = self.predict.tolist()
-        has_finished = False
+        self,
+        batch: ScheduleBatch,
+        accept_counts: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        accept_counts_cpu = accept_counts.cpu()
+        accepted_tokens_cpu = accepted_tokens.cpu()
+        offsets = torch.cumsum(accept_counts_cpu, dim=0) - accept_counts_cpu
+        adjusted_counts = torch.zeros_like(accept_counts_cpu)
 
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
-                    break
-                token_id = predict_cpu[idx]
+        for i, req in enumerate(batch.reqs):
+            count = int(accept_counts_cpu[i].item())
+            if count <= 0:
+                req.spec_verify_ct += 1
+                continue
+            start = int(offsets[i].item())
+            end = start + count
+            token_list = accepted_tokens_cpu[start:end].tolist()
+            actual = 0
+
+            for token_id in token_list:
+                token_id = int(token_id)
                 req.output_ids.append(token_id)
                 req.check_finished()
+                actual += 1
                 if req.finished():
-                    has_finished = True
-                    self.accepted_indices[i, j + 1 :] = -1
                     break
                 if req.grammar is not None:
                     try:
                         req.grammar.accept_token(token_id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n"
-                            f"{self.accepted_indices=}\n"
-                            f"{self.predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}")
                         raise e
 
             req.spec_verify_ct += 1
-            accepted_count = sum(1 for idx in accept_index_row if idx != -1)
-            req.spec_accepted_tokens += accepted_count
+            req.spec_accepted_tokens += actual
+            adjusted_counts[i] = actual
 
-        if has_finished:
-            self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
-
-        self.accepted_indices = self.accepted_indices[self.accepted_indices != -1]
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            self.accepted_indices
-        ]
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[
-                self.accepted_indices
-            ]
-
-        self.verified_id = self.predict[self.accepted_indices]
+        return adjusted_counts
 
     def _free_cache(
         self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
@@ -364,69 +375,112 @@ class LookaheadVerifyInput(SpecInput):
         vocab_size = logits_output.next_token_logits.shape[-1]
         logits = logits_output.next_token_logits.view(bs, self.draft_token_num, vocab_size)
 
-        self.predict = self.draft_token.clone().to(torch.int32)
-        self.accepted_indices = torch.full(
-            (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
+        draft_tokens = self.draft_token.view(bs, self.draft_token_num)
+        if force_greedy or sampling_info.is_all_greedy:
+            window_preds = torch.argmax(
+                logits[:, : self.lookahead_len], dim=-1
+            ).to(torch.int64)
+        else:
+            raise NotImplementedError("Non-greedy lookahead verify is not supported.")
+
+        draft_window = draft_tokens[
+            :, self.root_len : self.root_len + self.lookahead_len
+        ]
+        mismatch_mask = window_preds.ne(draft_window)
+        has_mismatch = mismatch_mask.any(dim=-1)
+        first_mismatch = mismatch_mask.float().argmax(dim=-1)
+
+        self.accept_length = torch.where(
+            has_mismatch,
+            first_mismatch - 1,
+            self.lookahead_len - 1,
+        ).to(torch.int32)
+        accept_counts = (self.accept_length + 1).clamp(min=0).to(torch.int64)
+
+        self.mismatch_token = torch.full(
+            (bs,), -1, dtype=torch.int64, device=self.device
         )
-        self.accept_length = torch.zeros((bs,), dtype=torch.int32, device=self.device)
+        if has_mismatch.any():
+            mismatch_indices = torch.nonzero(has_mismatch, as_tuple=True)[0]
+            self.mismatch_token[mismatch_indices] = window_preds[
+                mismatch_indices, first_mismatch[mismatch_indices]
+            ]
+
         self.accept_last_token = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        self.mismatch_token = torch.full((bs,), -1, dtype=torch.int64, device=self.device)
-        predicted_windows: List[List[int]] = []
+        self.accept_last_token[has_mismatch] = self.mismatch_token[has_mismatch]
+        self.accept_last_token[~has_mismatch] = window_preds[:, self.lookahead_len - 1]
+        self.accept_last_token_cpu = self.accept_last_token.cpu()
+        self.mismatch_token_cpu = self.mismatch_token.cpu()
+
+        self.predict = self.draft_token.to(torch.int32).clone()
+        if has_mismatch.any():
+            base_offsets = (
+                torch.arange(bs, device=self.device, dtype=torch.int64)
+                * self.draft_token_num
+            )
+            mismatch_pos = base_offsets + self.root_len + first_mismatch
+            mismatch_pos = mismatch_pos[has_mismatch]
+            self.predict[mismatch_pos] = self.mismatch_token[has_mismatch].to(
+                torch.int32
+            )
+
+        total_accepted = int(accept_counts.sum().item())
+        if total_accepted > 0:
+            base_offsets = (
+                torch.arange(bs, device=self.device, dtype=torch.int64)
+                * self.draft_token_num
+                + self.root_len
+            )
+            out_offsets = torch.cumsum(accept_counts, dim=0) - accept_counts
+            out_offsets_rep = out_offsets.repeat_interleave(accept_counts)
+            base_offsets_rep = base_offsets.repeat_interleave(accept_counts)
+            local_pos = (
+                torch.arange(total_accepted, device=self.device) - out_offsets_rep
+            )
+            self.accepted_indices = base_offsets_rep + local_pos
+            accepted_tokens = self.predict[self.accepted_indices]
+        else:
+            self.accepted_indices = torch.empty(
+                0, device=self.device, dtype=torch.int64
+            )
+            accepted_tokens = torch.empty(
+                0, device=self.device, dtype=torch.int32
+            )
+
+        draft_tokens_cpu = draft_tokens.cpu()
+        window_preds_cpu = window_preds.cpu()
         self.predicted_pairs = []
-
         for i in range(bs):
-            if force_greedy or sampling_info.is_all_greedy:
-                window_preds = torch.argmax(
-                    logits[i, : self.lookahead_len], dim=-1
-                ).tolist()
-            else:
-                def sample_token(local_logits: torch.Tensor) -> int:
-                    return self._sample_token_from_logits(
-                        local_logits,
-                        sampling_info.temperatures[i].item(),
-                        int(sampling_info.top_ks[i].item()),
-                        float(sampling_info.top_ps[i].item()),
-                        float(sampling_info.min_ps[i].item()),
-                    )
-
-                window_preds = [
-                    sample_token(logits[i, j]) for j in range(self.lookahead_len)
-                ]
-            predicted_windows.append(window_preds)
-
-            base = i * self.draft_token_num
-            mismatch = None
-            for j, pred in enumerate(window_preds):
-                draft_idx = self.root_len + j
-                if (
-                    int(
-                        self.draft_token[i * self.draft_token_num + draft_idx].item()
-                    )
-                    != pred
-                ):
-                    mismatch = j
-                    self.predict[i * self.draft_token_num + draft_idx] = pred
-                    break
-
-            if mismatch is None:
-                accept_len = self.lookahead_len - 1
-                last_idx = base + self.root_len + accept_len
-                self.accept_last_token[i] = int(self.predict[last_idx].item())
-            else:
-                accept_len = mismatch - 1
-                self.mismatch_token[i] = int(window_preds[mismatch])
-                self.accept_last_token[i] = int(window_preds[mismatch])
-            if accept_len >= 0:
-                for pos in range(accept_len + 1):
-                    self.accepted_indices[i, pos] = base + self.root_len + pos
-            self.accept_length[i] = accept_len
-
             pairs: List[Tuple[int, int]] = []
-            for j, pred in enumerate(window_preds):
-                prev_idx = base + (self.root_len - 1) + j
-                prev_token = int(self.draft_token[prev_idx].item())
+            for j in range(self.lookahead_len):
+                prev_token = int(draft_tokens_cpu[i, self.root_len - 1 + j].item())
+                pred = int(window_preds_cpu[i, j].item())
                 pairs.append((prev_token, pred))
             self.predicted_pairs.append(pairs)
+
+        adjusted_counts = self._fill_requests(batch, accept_counts, accepted_tokens)
+        adjusted_counts_gpu = adjusted_counts.to(self.device)
+        self.accept_length = adjusted_counts_gpu.to(torch.int32) - 1
+        accept_counts = (self.accept_length + 1).clamp(min=0).to(torch.int64)
+
+        total_accepted = int(accept_counts.sum().item())
+        if total_accepted > 0:
+            base_offsets = (
+                torch.arange(bs, device=self.device, dtype=torch.int64)
+                * self.draft_token_num
+                + self.root_len
+            )
+            out_offsets = torch.cumsum(accept_counts, dim=0) - accept_counts
+            out_offsets_rep = out_offsets.repeat_interleave(accept_counts)
+            base_offsets_rep = base_offsets.repeat_interleave(accept_counts)
+            local_pos = (
+                torch.arange(total_accepted, device=self.device) - out_offsets_rep
+            )
+            self.accepted_indices = base_offsets_rep + local_pos
+        else:
+            self.accepted_indices = torch.empty(
+                0, device=self.device, dtype=torch.int64
+            )
 
         if self.debug:
             def decode_text(req, tokens: List[int]) -> str:
@@ -453,12 +507,12 @@ class LookaheadVerifyInput(SpecInput):
                     except Exception:
                         return " ".join(str(t) for t in tokens)
 
-            draft_tokens = self.draft_token.view(bs, self.draft_token_num)
             for i, req in enumerate(batch.reqs):
                 prefix_tokens = req.origin_input_ids + req.output_ids
                 prefix_text = decode_text(req, prefix_tokens)
-                predict_window_str = decode_window(req, predicted_windows[i])
-                draft_window = draft_tokens[
+                pred_tokens = window_preds_cpu[i].tolist()
+                predict_window_str = decode_window(req, pred_tokens)
+                draft_window = draft_tokens_cpu[
                     i, self.root_len : self.root_len + self.lookahead_len
                 ].tolist()
                 draft_window_str = decode_window(req, draft_window)
@@ -473,13 +527,18 @@ class LookaheadVerifyInput(SpecInput):
                     predict_window_str,
                 )
                 mismatch_pos = -1
-                for j, pred in enumerate(predicted_windows[i]):
+                for j, pred in enumerate(pred_tokens):
                     if draft_window[j] != pred:
                         mismatch_pos = j
                         break
                 acc_len = int(self.accept_length[i].item())
-                row = self.accepted_indices[i]
-                indices = row[: acc_len + 1].tolist()
+                start = int(offsets_cpu[i].item())
+                end = start + int(accept_counts_cpu[i].item())
+                indices = (
+                    self.accepted_indices[start:end].tolist()
+                    if acc_len >= 0 and end > start
+                    else []
+                )
                 accepted_tokens = [int(self.predict[idx].item()) for idx in indices]
                 accepted_strs = None
                 if getattr(req, "tokenizer", None) is not None:
@@ -501,7 +560,7 @@ class LookaheadVerifyInput(SpecInput):
 
         if self.debug:
             for i, req in enumerate(batch.reqs):
-                pred_tokens = predicted_windows[i]
+                pred_tokens = window_preds_cpu[i].tolist()
                 pred_strs = None
                 if getattr(req, "tokenizer", None) is not None:
                     try:
@@ -537,7 +596,14 @@ class LookaheadVerifyInput(SpecInput):
                 #     topk_info,
                 # )
 
-        self._fill_requests(batch, logits_output)
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            self.accepted_indices
+        ]
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states[
+                self.accepted_indices
+            ]
+        self.verified_id = self.predict[self.accepted_indices]
 
         accept_length_cpu = self.accept_length.cpu()
         num_accepted_tokens = (accept_length_cpu + 1).sum().item()

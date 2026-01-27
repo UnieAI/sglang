@@ -50,7 +50,9 @@ class LookaheadWorker:
         self.random_prefill = server_args.lookahead_random_prefill
         self.disable_pool_update = server_args.lookahead_disable_pool_update
         self.keep_prefix_last_token = server_args.lookahead_keep_prefix_last_token
+        self.apply_prefix_drop = server_args.lookahead_apply_prefix_drop
         self.prefix_only_mask = server_args.lookahead_prefix_only_mask
+        self.disable_custom_mask = server_args.lookahead_disable_custom_mask
         self.debug = server_args.lookahead_debug
         self.jacobi_max_iter = server_args.lookahead_jacobi_max_iter
         if self.random_prefill:
@@ -237,6 +239,19 @@ class LookaheadWorker:
         draft_tokens_list: List[List[int]] = []
         positions_list: List[List[int]] = []
         custom_mask_list: List[torch.Tensor] = []
+        use_custom_mask = not self.disable_custom_mask
+        if (
+            self.prefix_only_mask
+            or self.apply_prefix_drop
+            or self.model_runner.server_args.enable_deterministic_inference
+        ):
+            if self.disable_custom_mask:
+                logger.warning(
+                    "lookahead_disable_custom_mask is ignored when "
+                    "lookahead_prefix_only_mask, lookahead_apply_prefix_drop, or "
+                    "deterministic inference is enabled."
+                )
+            use_custom_mask = True
 
         for i, req in enumerate(batch.reqs):
             if req.output_ids:
@@ -264,8 +279,9 @@ class LookaheadWorker:
                 positions.append(root_pos + 1 + idx)
             positions_list.append(positions)
 
-            custom_mask = self._build_custom_mask(seq_len)
-            custom_mask_list.append(custom_mask)
+            if use_custom_mask:
+                custom_mask = self._build_custom_mask(seq_len)
+                custom_mask_list.append(custom_mask)
 
             if self.debug:
                 prefix_tokens = req.origin_input_ids + req.output_ids
@@ -273,10 +289,13 @@ class LookaheadWorker:
                 root_str = self._decode_tokens(req, [last_token])[0]
                 window_strs = self._decode_tokens(req, lookahead_tokens)
                 try:
-                    mask_view = custom_mask.view(
-                        self.draft_token_num, seq_len + self.draft_token_num
-                    )
-                    mask_counts = mask_view.sum(dim=1).tolist()
+                    if use_custom_mask:
+                        mask_view = custom_mask.view(
+                            self.draft_token_num, seq_len + self.draft_token_num
+                        )
+                        mask_counts = mask_view.sum(dim=1).tolist()
+                    else:
+                        mask_counts = None
                 except Exception:
                     mask_counts = None
                 prefix_tail_ids = prefix_tokens[-8:] if prefix_tokens else []
@@ -326,7 +345,9 @@ class LookaheadWorker:
         positions_tensor = torch.tensor(
             positions_list, device=self.device, dtype=torch.int64
         ).reshape(-1)
-        custom_mask_tensor = torch.cat(custom_mask_list, dim=0)
+        custom_mask_tensor = (
+            torch.cat(custom_mask_list, dim=0) if use_custom_mask else None
+        )
 
         batch.spec_algorithm = SpeculativeAlgorithm.LOOKAHEAD
         batch.forward_mode = ForwardMode.TARGET_VERIFY
@@ -337,6 +358,10 @@ class LookaheadWorker:
             draft_token_num=self.draft_token_num,
             lookahead_len=self.lookahead_len,
             debug=self.debug,
+            keep_prefix_last_token=self.keep_prefix_last_token,
+            apply_prefix_drop=self.apply_prefix_drop,
+            prefix_only_mask=self.prefix_only_mask,
+            use_custom_mask=use_custom_mask,
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
@@ -380,7 +405,10 @@ class LookaheadWorker:
 
             new_window = list(old_window)
             filled = []
-            current = int(verify_input.accept_last_token[i].item())
+            if verify_input.accept_last_token_cpu is not None:
+                current = int(verify_input.accept_last_token_cpu[i].item())
+            else:
+                current = int(verify_input.accept_last_token[i].item())
             for pos in range(self.window):
                 od = self._pool.get(current)
                 if not od:
@@ -411,8 +439,13 @@ class LookaheadWorker:
     def _decode_mismatch_tokens(
         self,
         batch: ScheduleBatch,
-        mismatch_tokens: torch.Tensor,
+        verify_input: LookaheadVerifyInput,
     ) -> List[int]:
+        mismatch_tokens = (
+            verify_input.mismatch_token_cpu
+            if verify_input.mismatch_token_cpu is not None
+            else verify_input.mismatch_token
+        )
         mismatch_indices = []
         mismatch_token_list = []
         for i, req in enumerate(batch.reqs):
@@ -582,9 +615,7 @@ class LookaheadWorker:
             batch, logits_output, self.page_size
         )
         self._update_window_and_pool(batch, verify_input)
-        mismatch_indices = self._decode_mismatch_tokens(
-            batch, verify_input.mismatch_token
-        )
+        mismatch_indices = self._decode_mismatch_tokens(batch, verify_input)
 
         # Build per-request next_token_ids (accepted draft tokens + mismatch token if any)
         accept_counts = (verify_input.accept_length + 1).clamp(min=0).to(torch.int64)

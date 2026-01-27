@@ -451,6 +451,25 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            if (
+                forward_batch.forward_mode.is_decode()
+                and not forward_batch.is_prefill_only
+                and not self.enable_overlap
+                and not self.enable_spec
+                and not is_verify
+            ):
+                out, next_token_ids = self.model_runner.forward_decode_with_sampling(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                )
+                return GenerationBatchResult(
+                    logits_output=out.logits_output,
+                    next_token_ids=next_token_ids,
+                    can_run_cuda_graph=out.can_run_graph,
+                    expert_distribution_metrics=out.expert_distribution_metrics,
+                )
+
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,

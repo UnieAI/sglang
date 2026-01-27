@@ -273,6 +273,70 @@ def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
     return output
 
 
+@triton.jit
+def fused_add_rmsnorm_post_kernel(
+    output_ptr,
+    residual_out_ptr,
+    activ_ptr,
+    residual_ptr,
+    post_ptr,
+    weight_ptr,
+    eps: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    input_start = pid * hidden_dim
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+
+    a_ = tl.load(activ_ptr + input_start + offsets, mask=mask, other=0.0)
+    r_ = tl.load(residual_ptr + input_start + offsets, mask=mask, other=0.0)
+    p_ = tl.load(post_ptr + input_start + offsets, mask=mask, other=0.0)
+    a = a_.to(tl.float32)
+    r = r_.to(tl.float32)
+    p = p_.to(tl.float32)
+
+    residual_out = a + r + p
+    rms = tl.sqrt(tl.sum(residual_out * residual_out, axis=0) / hidden_dim + eps)
+
+    w_ = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
+    w = w_.to(tl.float32)
+
+    out = residual_out / rms * w
+
+    tl.store(output_ptr + input_start + offsets, out, mask=mask)
+    tl.store(residual_out_ptr + input_start + offsets, residual_out, mask=mask)
+
+
+def fused_add_rmsnorm_post(x, residual, post, weight, eps):
+    assert len(x.shape) == 2
+    output = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    bs, hidden_dim = x.shape
+    max_warps = 16 if _is_hip else 32
+    config = {
+        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+        "num_warps": max(
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+        ),
+    }
+
+    fused_add_rmsnorm_post_kernel[(bs,)](
+        output,
+        residual_out,
+        x,
+        residual,
+        post,
+        weight,
+        eps=eps,
+        hidden_dim=hidden_dim,
+        **config,
+    )
+    return output, residual_out
+
+
 class FusedDualResidualRMSNorm:
     """
     Fused implementation of

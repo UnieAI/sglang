@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.srt.layers.elementwise import fused_add_rmsnorm_post
+
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
@@ -126,6 +128,22 @@ class RMSNorm(MultiPlatformOp):
             # but right now we can only have hidden_states+(residual+post_residual_addition).
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
             # we probably need to add another parameter to fused_add_rmsnorm
+            if (
+                post_residual_addition is not None
+                and x.is_cuda
+                and x.dim() == 2
+                and x.is_contiguous()
+                and residual.is_contiguous()
+                and post_residual_addition.is_contiguous()
+            ):
+                out, residual_out = fused_add_rmsnorm_post(
+                    x,
+                    residual,
+                    post_residual_addition,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
+                return out, residual_out
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)

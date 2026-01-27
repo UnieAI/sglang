@@ -114,11 +114,6 @@ class SpeculativeAlgorithm(Enum):
 
             return NGRAMWorker
         elif self.is_lookahead():
-            if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
-
             from sglang.srt.speculative.lookahead_worker import LookaheadWorker
 
             return LookaheadWorker

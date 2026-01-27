@@ -303,6 +303,24 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-ngram-branch-length` | The branch length for ngram speculative decoding. | `18` | Type: int |
 | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
 
+## Lookahead speculative decoding
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--lookahead-window` | Lookahead draft window size. | `8` | Type: int |
+| `--lookahead-ngram` | Lookahead ngram size (fixed to 2). | `2` | Type: int |
+| `--lookahead-pool-size` | Capacity of the lookahead 2-gram pool. | `16384` | Type: int |
+| `--lookahead-guess-set-size` | Max candidates per prefix token in the pool. | `3` | Type: int |
+| `--lookahead-pool-from-prompt` | Initialize the pool from the prompt tokens. | `False` | bool flag (set to enable) |
+| `--lookahead-random-prefill` | Use random tokens to prefill the window (debug). | `False` | bool flag (set to enable) |
+| `--lookahead-disable-pool-update` | Disable updating the pool from forward predictions. | `False` | bool flag (set to enable) |
+| `--lookahead-keep-prefix-last-token` | Allow drafts to attend to the prefix last token. | `False` | bool flag (set to enable) |
+| `--lookahead-apply-prefix-drop` | Apply prefix last-token masking when keep-prefix-last-token is off. | `False` | bool flag (set to enable) |
+| `--lookahead-prefix-only-mask` | Only allow drafts to attend to the prefix (no draft-to-draft). | `False` | bool flag (set to enable) |
+| `--lookahead-disable-custom-mask` | Disable building custom attention masks for lookahead verify. | `False` | bool flag (set to enable) |
+| `--lookahead-debug` | Enable lookahead debug logging. | `False` | bool flag (set to enable) |
+| `--lookahead-jacobi-max-iter` | Max Jacobi iterations in lookahead forward. | `1` | Type: int |
+| `--lookahead-enable-overlap` | Enable overlap scheduling for lookahead (experimental). | `False` | bool flag (set to enable) |
+
 ## Multi-layer Eagle speculative decoding
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
@@ -414,6 +432,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-cuda-graph` | Disable cuda graph. | `False` | bool flag (set to enable) |
 | `--disable-cuda-graph-padding` | Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed. | `False` | bool flag (set to enable) |
 | `--enable-profile-cuda-graph` | Enable profiling of cuda graph capture. | `False` | bool flag (set to enable) |
+| `--enable-decode-step-cuda-graph` | Enable decode-step CUDA graphs (forward + greedy argmax) when no logit processors, penalties, or grammars are active. | `False` | bool flag (set to enable) |
 | `--enable-cudagraph-gc` | Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process. | `False` | bool flag (set to enable) |
 | `--enable-layerwise-nvtx-marker` | Enable layerwise NVTX profiling annotations for the model. This adds NVTX markers to every layer for detailed per-layer performance analysis with Nsight Systems. | `False` | bool flag (set to enable) |
 | `--enable-nccl-nvls` | Enable NCCL NVLS for prefill heavy requests when available. | `False` | bool flag (set to enable) |

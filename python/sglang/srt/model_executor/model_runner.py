@@ -1899,6 +1899,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     positions=None,
                     draft_token_num=num_tokens_per_bs,
                     lookahead_len=self.server_args.lookahead_window,
+                    keep_prefix_last_token=self.server_args.lookahead_keep_prefix_last_token,
+                    prefix_only_mask=self.server_args.lookahead_prefix_only_mask,
                 )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
@@ -2264,6 +2266,110 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.eplb_manager.on_forward_pass_end()
 
         return output
+
+    def forward_decode_with_sampling(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Tuple[ModelRunnerOutput, torch.Tensor]:
+        if not forward_batch.forward_mode.is_decode():
+            raise ValueError("forward_decode_with_sampling requires decode mode.")
+        if not self.pp_group.is_last_rank:
+            raise ValueError("forward_decode_with_sampling must run on last PP rank.")
+
+        self.forward_pass_id += 1
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id,
+            forward_batch,
+        ) as recorder_outputs:
+            logits_output, next_token_ids, can_run_graph = (
+                self._forward_raw_with_sampling(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                )
+            )
+
+        output = ModelRunnerOutput(
+            logits_output=logits_output,
+            can_run_graph=can_run_graph,
+        )
+        output.expert_distribution_metrics = recorder_outputs.get("metrics")
+
+        get_global_experts_capturer().on_forward_end(
+            forward_batch=forward_batch,
+            can_run_graph=can_run_graph,
+            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+        )
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end()
+
+        return output, next_token_ids
+
+    def _forward_raw_with_sampling(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, bool]:
+        mode_check = (
+            forward_batch.forward_mode.is_cpu_graph
+            if self.device == "cpu"
+            else forward_batch.forward_mode.is_cuda_graph
+        )
+        can_run_graph = bool(
+            mode_check()
+            and self.graph_runner
+            and self.graph_runner.can_run(forward_batch)
+        )
+
+        if (
+            can_run_graph
+            and self._can_use_decode_graph_sampling(forward_batch)
+            and getattr(self.graph_runner, "capture_decode_sample", False)
+            and hasattr(self.graph_runner, "replay_with_sampling")
+        ):
+            logits_output, next_token_ids = self.graph_runner.replay_with_sampling(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+            return logits_output, next_token_ids, can_run_graph
+
+        output = self._forward_raw(
+            forward_batch,
+            skip_attn_backend_init,
+            pp_proxy_tensors,
+        )
+        next_token_ids = self.sample(output.logits_output, forward_batch)
+        return output.logits_output, next_token_ids, output.can_run_graph
+
+    def _can_use_decode_graph_sampling(self, forward_batch: ForwardBatch) -> bool:
+        if not self.server_args.enable_decode_step_cuda_graph:
+            return False
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        if self.spec_algorithm is None or not self.spec_algorithm.is_none():
+            return False
+        if forward_batch.is_prefill_only or forward_batch.return_logprob:
+            return False
+        sampling_info = forward_batch.sampling_info
+        if sampling_info is None or not sampling_info.is_all_greedy:
+            return False
+        if sampling_info.grammars:
+            return False
+        if sampling_info.has_custom_logit_processor:
+            return False
+        if sampling_info.logit_bias is not None:
+            return False
+        if (
+            sampling_info.penalizer_orchestrator is not None
+            and sampling_info.penalizer_orchestrator.is_required
+        ):
+            return False
+        return True
 
     def _forward_raw(
         self,
