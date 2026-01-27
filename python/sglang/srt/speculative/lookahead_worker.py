@@ -15,6 +15,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.lookahead_info import LookaheadVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_cuda_alike
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,15 @@ class LookaheadWorker:
             )
 
         self.max_batch_size = target_worker.max_running_requests
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else self.model_runner.device
+        cuda_alike = is_cuda_alike()
+        if gpu_id >= 0 and cuda_alike:
+            self.device = f"cuda:{gpu_id}"
+        else:
+            self.device = self.model_runner.device
+            if gpu_id >= 0 and not cuda_alike:
+                logger.warning(
+                    "CUDA/ROCm unavailable; falling back to device %s.", self.device
+                )
         self.vocab_size = self.model_runner.model_config.vocab_size
 
         self._states: Dict[str, LookaheadState] = {}
@@ -554,18 +563,17 @@ class LookaheadWorker:
             if jacobi_iters == 1:
                 break
 
-            window_preds = verify_input.compute_window_preds(batch, logits_output)
-            preds_tensor = torch.tensor(
-                window_preds, device=self.device, dtype=torch.int64
-            )
+            preds_tensor = verify_input.compute_window_preds(batch, logits_output)
             draft_view = verify_input.draft_token.view(bs, self.draft_token_num)
             draft_window = draft_view[
                 :, self.root_len : self.root_len + self.lookahead_len
             ]
-            if torch.equal(draft_window, preds_tensor):
-                if self.debug:
+            if preds_tensor.device != draft_window.device:
+                preds_tensor = preds_tensor.to(draft_window.device)
+            if self.debug:
+                if torch.equal(draft_window, preds_tensor):
                     logger.info("lookahead jacobi converged at iter=%d", it + 1)
-                break
+                    break
             if it + 1 >= jacobi_iters:
                 break
             draft_window.copy_(preds_tensor)
@@ -579,23 +587,47 @@ class LookaheadWorker:
         )
 
         # Build per-request next_token_ids (accepted draft tokens + mismatch token if any)
-        accept_counts = (verify_input.accept_length + 1).clamp(min=0).tolist()
-        accepted_flat = (
-            next_token_ids.tolist() if next_token_ids is not None else []
-        )
-        offset = 0
-        final_tokens: List[int] = []
-        mismatch_set = set(mismatch_indices)
-        for i, count in enumerate(accept_counts):
-            if count > 0:
-                final_tokens.extend(accepted_flat[offset : offset + count])
-                offset += count
-            if i in mismatch_set:
-                final_tokens.append(int(verify_input.mismatch_token[i].item()))
+        accept_counts = (verify_input.accept_length + 1).clamp(min=0).to(torch.int64)
+        if next_token_ids is None:
+            accepted_flat = torch.empty(0, device=self.device, dtype=torch.int64)
+        else:
+            accepted_flat = next_token_ids.to(torch.int64)
+        mismatch_tokens = verify_input.mismatch_token.to(torch.int64)
+        mismatch_mask = torch.zeros_like(mismatch_tokens, dtype=torch.bool)
+        if mismatch_indices:
+            mismatch_idx_tensor = torch.tensor(
+                mismatch_indices, device=self.device, dtype=torch.int64
+            )
+            mismatch_mask[mismatch_idx_tensor] = True
 
-        next_token_ids = torch.tensor(
-            final_tokens, device=self.device, dtype=torch.int64
-        )
+        total_out = accepted_flat.numel() + len(mismatch_indices)
+        if total_out == 0:
+            next_token_ids = torch.empty(0, device=self.device, dtype=torch.int64)
+        else:
+            output_lengths = accept_counts + mismatch_mask.to(accept_counts.dtype)
+            out_offsets = torch.cumsum(output_lengths, dim=0) - output_lengths
+            final_tokens = torch.empty(
+                total_out, device=self.device, dtype=torch.int64
+            )
+
+            total_accepted = accepted_flat.numel()
+            if total_accepted:
+                accept_offsets = torch.cumsum(accept_counts, dim=0) - accept_counts
+                accept_offsets_rep = accept_offsets.repeat_interleave(accept_counts)
+                out_offsets_rep = out_offsets.repeat_interleave(accept_counts)
+                positions = out_offsets_rep + (
+                    torch.arange(total_accepted, device=self.device)
+                    - accept_offsets_rep
+                )
+                final_tokens[positions] = accepted_flat
+
+            if len(mismatch_indices):
+                mismatch_positions = out_offsets + accept_counts
+                final_tokens[mismatch_positions[mismatch_mask]] = mismatch_tokens[
+                    mismatch_mask
+                ]
+
+            next_token_ids = final_tokens
 
         batch.forward_mode = ForwardMode.DECODE
 
