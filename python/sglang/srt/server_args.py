@@ -470,7 +470,7 @@ class ServerArgs:
     # Speculative decoding (lookahead)
     lookahead_window: int = 8
     lookahead_ngram: int = 2
-    lookahead_pool_size: int = 1024
+    lookahead_pool_size: int = 16384
     lookahead_guess_set_size: int = 3
     lookahead_pool_from_prompt: bool = False
     lookahead_random_prefill: bool = False
@@ -478,6 +478,7 @@ class ServerArgs:
     lookahead_keep_prefix_last_token: bool = False
     lookahead_prefix_only_mask: bool = False
     lookahead_debug: bool = False
+    lookahead_jacobi_max_iter: int = 1
 
     # Expert parallelism
     ep_size: int = 1
@@ -2279,6 +2280,8 @@ class ServerArgs:
                 raise ValueError("lookahead_pool_size must be >= 1.")
             if self.lookahead_guess_set_size <= 0:
                 raise ValueError("lookahead_guess_set_size must be >= 1.")
+            if self.lookahead_jacobi_max_iter <= 0:
+                raise ValueError("lookahead_jacobi_max_iter must be >= 1.")
 
             desired_draft_tokens = 1 + self.lookahead_window
             if (
@@ -3836,6 +3839,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.lookahead_debug,
             help="Enable lookahead debug logging.",
+        )
+        parser.add_argument(
+            "--lookahead-jacobi-max-iter",
+            type=int,
+            default=ServerArgs.lookahead_jacobi_max_iter,
+            help="Max iterations for Jacobi decoding in lookahead forward.",
         )
 
         # Multi-layer Eagle speculative decoding

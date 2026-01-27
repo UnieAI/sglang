@@ -51,6 +51,7 @@ class LookaheadWorker:
         self.keep_prefix_last_token = server_args.lookahead_keep_prefix_last_token
         self.prefix_only_mask = server_args.lookahead_prefix_only_mask
         self.debug = server_args.lookahead_debug
+        self.jacobi_max_iter = server_args.lookahead_jacobi_max_iter
         if self.random_prefill:
             logger.warning(
                 "lookahead_random_prefill is ignored; using last-token prefill."
@@ -375,7 +376,14 @@ class LookaheadWorker:
                 od = self._pool.get(current)
                 if not od:
                     break
-                next_token = next(reversed(od))
+                choices = list(od.keys())
+                if len(choices) == 1:
+                    next_token = choices[0]
+                else:
+                    idx = torch.randint(
+                        0, len(choices), (1,), device=self.device, dtype=torch.int64
+                    ).item()
+                    next_token = choices[idx]
                 new_window[pos] = next_token
                 filled.append((current, next_token))
                 current = next_token
@@ -529,17 +537,39 @@ class LookaheadWorker:
             )
 
         self._prepare_for_speculative_decoding(batch)
-        model_worker_batch = batch.get_model_worker_batch()
+        verify_input: LookaheadVerifyInput = batch.spec_info
+        logits_output = None
+        can_run_cuda_graph = False
 
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
-        logits_output, can_run_cuda_graph = (
-            batch_result.logits_output,
-            batch_result.can_run_cuda_graph,
-        )
+        jacobi_iters = max(1, int(self.jacobi_max_iter))
+        bs = batch.batch_size()
+        for it in range(jacobi_iters):
+            model_worker_batch = batch.get_model_worker_batch()
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
+            logits_output = batch_result.logits_output
+            can_run_cuda_graph = batch_result.can_run_cuda_graph
 
-        verify_input: LookaheadVerifyInput = model_worker_batch.spec_info
+            if jacobi_iters == 1:
+                break
+
+            window_preds = verify_input.compute_window_preds(batch, logits_output)
+            preds_tensor = torch.tensor(
+                window_preds, device=self.device, dtype=torch.int64
+            )
+            draft_view = verify_input.draft_token.view(bs, self.draft_token_num)
+            draft_window = draft_view[
+                :, self.root_len : self.root_len + self.lookahead_len
+            ]
+            if torch.equal(draft_window, preds_tensor):
+                if self.debug:
+                    logger.info("lookahead jacobi converged at iter=%d", it + 1)
+                break
+            if it + 1 >= jacobi_iters:
+                break
+            draft_window.copy_(preds_tensor)
+
         logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
             batch, logits_output, self.page_size
         )

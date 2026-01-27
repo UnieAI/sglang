@@ -292,6 +292,36 @@ class LookaheadVerifyInput(SpecInput):
         probs = probs / probs.sum()
         return torch.multinomial(probs, num_samples=1).item()
 
+    def compute_window_preds(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+    ) -> List[List[int]]:
+        sampling_info = batch.sampling_info
+        logits = logits_output.next_token_logits.clone()
+
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                logits,
+                sampling_info,
+                num_tokens_in_batch=self.draft_token_num,
+            )
+
+        if sampling_info.penalizer_orchestrator.is_required:
+            linear_penalty = torch.zeros(
+                (batch.batch_size(), logits.shape[1]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            sampling_info.apply_logits_bias(linear_penalty)
+            logits.add_(torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0))
+
+        bs = batch.batch_size()
+        vocab_size = logits.shape[-1]
+        logits = logits.view(bs, self.draft_token_num, vocab_size)
+        window_preds = torch.argmax(logits[:, : self.lookahead_len], dim=-1)
+        return window_preds.tolist()
+
     def verify(
         self,
         batch: ScheduleBatch,
