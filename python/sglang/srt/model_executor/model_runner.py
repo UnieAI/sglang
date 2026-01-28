@@ -98,6 +98,7 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.persistent.scheduler import PersistentDecodeScheduler
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -144,6 +145,7 @@ from sglang.srt.utils import (
     dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_cpu_ids_by_node,
     get_local_ip_auto,
     init_custom_process_group,
@@ -192,6 +194,7 @@ MLA_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "triton",
+    "persistent_triton",
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
@@ -296,6 +299,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        self.persistent_scheduler = None
+        self.persistent_backend = None
+        self._persistent_decode_logged = False
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
         )
@@ -580,6 +586,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
+
+        self.init_persistent_scheduler()
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
@@ -1606,6 +1614,58 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.attn_backend = self._get_attention_backend()
 
+    def _resolve_persistent_backend(self):
+        backend = self.attn_backend
+        seen = set()
+        while backend is not None:
+            backend_id = id(backend)
+            if backend_id in seen:
+                break
+            seen.add(backend_id)
+            if hasattr(backend, "decode_backend"):
+                backend = backend.decode_backend
+                continue
+            if hasattr(backend, "primary"):
+                backend = backend.primary
+                continue
+            break
+        if backend is not None and hasattr(backend, "get_decode_graph"):
+            return backend
+        return None
+
+    def init_persistent_scheduler(self):
+        if (
+            self.device != "cuda"
+            or self.server_args.enable_pdmux
+            or self.server_args.enable_two_batch_overlap
+            or self.pp_size > 1
+        ):
+            return
+        if not (
+            self.server_args.enable_persistent_gpu_scheduler
+            or get_bool_env_var("SGLANG_ENABLE_PERSISTENT_GPU_SCHEDULER", "false")
+        ):
+            return
+        backend = self._resolve_persistent_backend()
+        if backend is None:
+            return
+        try:
+            from sglang.srt.persistent import PersistentDecodeScheduler
+        except Exception as exc:
+            logger.warning("Persistent scheduler unavailable: %s", exc)
+            return
+        self.persistent_backend = backend
+        self.persistent_scheduler = PersistentDecodeScheduler(self)
+        log_info_on_rank0(
+            logger,
+            (
+                "Persistent decode scheduler enabled "
+                f"(backend={type(backend).__name__}, "
+                f"gpu_scheduler={self.persistent_scheduler.use_gpu_scheduler}, "
+                f"validate_steps={self.persistent_scheduler.validate_steps})."
+            ),
+        )
+
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
         draft_attn_backend = self.server_args.speculative_draft_attention_backend
@@ -2283,6 +2343,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
+
+        if (
+            can_run_graph
+            and self.persistent_scheduler is not None
+            and self.persistent_scheduler.use_gpu_scheduler
+            and forward_batch.forward_mode.is_decode()
+            and self.spec_algorithm.is_none()
+        ):
+            if not self._persistent_decode_logged:
+                buckets = None
+                if (
+                    self.persistent_backend is not None
+                    and hasattr(self.persistent_backend, "decode_graph_cache")
+                ):
+                    buckets = self.persistent_backend.decode_graph_cache.buckets()
+                if not buckets and hasattr(self.graph_runner, "capture_bs"):
+                    buckets = list(self.graph_runner.capture_bs)
+                log_info_on_rank0(
+                    logger,
+                    (
+                        "Persistent decode path active "
+                        f"(gpu_scheduler={self.persistent_scheduler.use_gpu_scheduler}, "
+                        f"buckets={buckets})."
+                    ),
+                )
+                self._persistent_decode_logged = True
+            ret = self.persistent_scheduler.submit_decode(
+                forward_batch,
+                self.graph_runner,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+            )
+            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         if can_run_graph:
             ret = self.graph_runner.replay(
