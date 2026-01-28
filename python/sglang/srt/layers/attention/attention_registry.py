@@ -102,6 +102,26 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
+@register_attention_backend("persistent_triton")
+def create_persistent_triton_backend(runner):
+    assert not runner.model_config.is_encoder_decoder, (
+        "Cross attention is not supported in the persistent_triton attention backend. "
+        "Please use `--attention-backend flashinfer`."
+    )
+    if runner.server_args.enable_double_sparsity:
+        from sglang.srt.layers.attention.double_sparsity_backend import (
+            DoubleSparseAttnBackend,
+        )
+
+        return DoubleSparseAttnBackend(runner)
+    else:
+        from sglang.srt.layers.attention.persistent_triton_backend import (
+            PersistentTritonAttnBackend,
+        )
+
+        return PersistentTritonAttnBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -200,9 +220,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
-                    runner.server_args.attention_backend == "triton"
+                    runner.server_args.attention_backend in ["triton", "persistent_triton"]
                     or runner.server_args.attention_backend == "trtllm_mha"
-                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
+                ), "triton, persistent_triton, or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"

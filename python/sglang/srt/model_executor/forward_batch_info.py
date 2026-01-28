@@ -356,6 +356,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
+    # Optional cuda graph bucket size selected by persistent scheduler
+    cuda_graph_bucket: Optional[int] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None

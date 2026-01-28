@@ -278,6 +278,7 @@ class PiecewiseCudaGraphRunner:
                     )
 
         self.raw_num_tokens = 0
+        self._register_prefill_buckets()
 
     def warmup_torch_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
@@ -535,6 +536,12 @@ class PiecewiseCudaGraphRunner:
             run_once()
 
         return
+
+    def _register_prefill_buckets(self) -> None:
+        attn_backend = self.model_runner.attn_backend
+        if not hasattr(attn_backend, "set_prefill_graph_buckets"):
+            return
+        attn_backend.set_prefill_graph_buckets(self.capture_num_tokens)
 
     def replay_prepare(
         self,

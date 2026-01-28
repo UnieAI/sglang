@@ -119,6 +119,7 @@ SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
+    "persistent_triton",
     "torch_native",
     "flex_attention",
     "nsa",
@@ -148,9 +149,18 @@ ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "moo
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
+    "flashinfer",
+    "fa3",
+    "triton",
+    "persistent_triton",
+]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = [
+    "fa3",
+    "triton",
+    "persistent_triton",
+]
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
@@ -574,6 +584,8 @@ class ServerArgs:
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    enable_persistent_gpu_scheduler: bool = False
+    persistent_validate_steps: int = 0
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_tokenizer_batch_decode: bool = False
@@ -1277,7 +1289,14 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend"]
+            supported_backends = [
+                "triton",
+                "persistent_triton",
+                "trtllm_mha",
+                "fa3",
+                "fa4",
+                "ascend",
+            ]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1367,9 +1386,13 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
+                "persistent_triton",
                 "trtllm_mha",
                 "intel_xpu",
-            }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
+            }, (
+                "fa3, aiter, triton, persistent_triton, trtllm_mha or intel_xpu is "
+                f"required for Llama4 model but got {self.attention_backend}"
+            )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1465,9 +1488,9 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
-            assert self.attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
+            assert self.attention_backend not in ["triton", "persistent_triton"], (
+                "NemotronHForCausalLM does not support triton or persistent_triton "
+                "attention backend, as the first layer might not be an attention layer"
             )
         elif model_arch in [
             "Qwen3MoeForCausalLM",
@@ -1863,6 +1886,7 @@ class ServerArgs:
                     else:  # FA4 + MHA
                         KV4_FA4_MHA_BACKEND_CHOICES = [
                             "triton",
+                            "persistent_triton",
                             "torch_native",
                             "flex_attention",
                         ]
@@ -1890,6 +1914,7 @@ class ServerArgs:
                     else:  # !FA4 + MHA
                         KV4_ATTENTION_MHA_BACKEND_CHOICES = [
                             "triton",
+                            "persistent_triton",
                             "torch_native",
                             "flex_attention",
                             "trtllm_mha",
@@ -2513,7 +2538,7 @@ class ServerArgs:
                 )
 
             if is_deepseek_model:
-                if self.attention_backend not in ["fa3", "triton"]:
+                if self.attention_backend not in ["fa3", "triton", "persistent_triton"]:
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
                     )
@@ -2554,7 +2579,7 @@ class ServerArgs:
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
                 self.disable_cuda_graph = True
-            if self.attention_backend not in ["triton", "aiter"]:
+            if self.attention_backend not in ["triton", "persistent_triton", "aiter"]:
                 logger.warning(
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
                 )
@@ -4277,6 +4302,18 @@ class ServerArgs:
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+        )
+        parser.add_argument(
+            "--enable-persistent-gpu-scheduler",
+            action="store_true",
+            default=ServerArgs.enable_persistent_gpu_scheduler,
+            help="Enable GPU task queue draining for persistent decode scheduling.",
+        )
+        parser.add_argument(
+            "--persistent-validate-steps",
+            type=int,
+            default=ServerArgs.persistent_validate_steps,
+            help="Validate persistent decode outputs for the first N decode steps (no spec).",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",

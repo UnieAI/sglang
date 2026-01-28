@@ -74,6 +74,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.persistent.graph_launcher import replay_graph as _replay_graph
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -533,6 +534,53 @@ class CudaGraphRunner:
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
+        self._register_graphs_with_backend()
+
+    def _register_graphs_with_backend(self) -> None:
+        attn_backend = getattr(self.model_runner, "persistent_backend", None)
+        if attn_backend is None:
+            attn_backend = self.model_runner.attn_backend
+        if not hasattr(attn_backend, "put_decode_graph"):
+            return
+        if self.enable_pdmux:
+            logger.warning(
+                "Persistent graph registration skipped because pdmux is enabled."
+            )
+            return
+        if hasattr(attn_backend, "set_decode_graph_buckets"):
+            attn_backend.set_decode_graph_buckets(self.capture_bs)
+        for bs in self.capture_bs:
+            graph = self.graphs.get(bs)
+            output_buffers = self.output_buffers.get(bs)
+            if graph is None:
+                continue
+            attn_backend.put_decode_graph(
+                bs,
+                {
+                    "graph": graph,
+                    "output_buffers": output_buffers,
+                    "num_tokens_per_bs": self.num_tokens_per_bs,
+                    "forward_mode": self.capture_forward_mode,
+                },
+            )
+
+    def _get_persistent_graph_entry(self, bs: int):
+        attn_backend = getattr(self.model_runner, "persistent_backend", None)
+        if attn_backend is None:
+            attn_backend = self.model_runner.attn_backend
+        get_graph = getattr(attn_backend, "get_decode_graph", None)
+        if get_graph is None:
+            return None
+        entry = get_graph(bs)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("graph") is None or entry.get("output_buffers") is None:
+            return None
+        if entry.get("num_tokens_per_bs") != self.num_tokens_per_bs:
+            return None
+        if entry.get("forward_mode") != self.capture_forward_mode:
+            return None
+        return entry
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -792,9 +840,17 @@ class CudaGraphRunner:
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
+            bs = self.capture_bs[index]
         else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
-        bs = self.capture_bs[index]
+            bucket_bs = forward_batch.cuda_graph_bucket
+            if bucket_bs is not None and bucket_bs > 0:
+                bs = int(bucket_bs)
+                if bs not in self.capture_bs:
+                    index = bisect.bisect_left(self.capture_bs, raw_bs)
+                    bs = self.capture_bs[index]
+            else:
+                index = bisect.bisect_left(self.capture_bs, raw_bs)
+                bs = self.capture_bs[index]
 
         seq_lens_cpu = buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
@@ -861,8 +917,13 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
-        output = self.output_buffers[graph_key]
+        entry = None if self.enable_pdmux else self._get_persistent_graph_entry(self.bs)
+        if entry is not None:
+            _replay_graph(entry["graph"])
+            output = entry["output_buffers"]
+        else:
+            _replay_graph(self.graphs[graph_key])
+            output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
