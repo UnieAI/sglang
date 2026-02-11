@@ -1,0 +1,3 @@
+[submodule "turbomind"]
+	path = turbomind
+	url = https://github.com/InternLM/turbomind
