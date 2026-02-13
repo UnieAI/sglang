@@ -2920,7 +2920,10 @@ class ServerArgs:
             "implementation is available.\n"
             '* "sglang" will use the SGLang model implementation.\n'
             '* "transformers" will use the Transformers model '
+            "implementation.\n"
             '* "mindspore" will use the MindSpore model '
+            "implementation.\n"
+            '* "turbomind" will use the Turbomind model '
             "implementation.\n",
         )
 
@@ -5148,6 +5151,8 @@ class ServerArgs:
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
+        elif self.model_impl == "turbomind":
+            assert is_cuda(), "Turbomind model impl is only supported on NVIDIA GPU."
 
         # Check metrics labels
         if (
